@@ -1,0 +1,1 @@
+import {render,screen} from '@testing-library/react';import {describe,expect,it} from 'vitest';import {Status} from '../src/components/ui';describe('Status',()=>{it('renders a known status',()=>{render(<Status value="RUNNING"/>);expect(screen.getByText('RUNNING')).toBeInTheDocument()})});

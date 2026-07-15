@@ -1,0 +1,21 @@
+[Unit]
+Description=LocalEC2 dedicated compute node agent
+After=network-online.target libvirtd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=localec2
+Group=localec2
+EnvironmentFile=/etc/localec2/agent.env
+ExecStart=/opt/localec2-agent/venv/bin/python /opt/localec2-agent/agent.py --interval 15
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/localec2
+
+[Install]
+WantedBy=multi-user.target
