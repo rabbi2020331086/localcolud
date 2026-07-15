@@ -20,17 +20,6 @@ if ($pnpmVersion -ne '10.15.1') {
     throw "pnpm $pnpmVersion is installed, but this Node.js 20 setup requires pnpm 10.15.1. Run .\setup-windows.ps1 again."
 }
 
-$multipassCommand = Get-Command 'multipass.exe' -ErrorAction SilentlyContinue
-if (-not $multipassCommand) {
-    $installedMultipass = Join-Path $env:ProgramFiles 'Multipass\bin\multipass.exe'
-    if (Test-Path $installedMultipass) {
-        $multipassCommand = Get-Item $installedMultipass
-    }
-}
-if (-not $multipassCommand) {
-    Write-Warning 'Multipass is unavailable. The console will open, but VM launch/start/stop actions cannot work until Canonical Multipass is installed and PowerShell is reopened.'
-}
-
 $timeStatus = (& w32tm /query /status 2>&1 | Out-String)
 if ($timeStatus -match 'Leap Indicator:\s*3' -or $timeStatus -match 'not synchronized') {
     throw 'Windows time is not synchronized. Open Settings > Time & language > Date & time, enable Set time automatically, click Sync now, then reopen PowerShell.'

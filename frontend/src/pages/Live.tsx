@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 import {
@@ -9,9 +9,6 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import "@xterm/xterm/css/xterm.css";
 import { api } from "../api/client";
 import { useAuth } from "../store/auth";
 import { Card, PageHeader, Status } from "../components/ui";
@@ -131,9 +128,6 @@ export function MonitorPage() {
 
 export function TerminalPage() {
   const { instanceId = "" } = useParams();
-  const token = useAuth((state) => state.accessToken);
-  const host = useRef<HTMLDivElement>(null);
-  const [state, setState] = useState("Connecting");
   const { data: item } = useQuery({
     queryKey: ["instance", instanceId],
     queryFn: () =>
@@ -142,79 +136,19 @@ export function TerminalPage() {
         .then((response) => response.data),
   });
 
-  useEffect(() => {
-    if (!host.current || item?.status !== "RUNNING") return;
-    const terminal = new Terminal({
-      cursorBlink: true,
-      theme: { background: "#08151e", foreground: "#d8e8ef" },
-      fontFamily: "Cascadia Mono,Consolas,monospace",
-      fontSize: 14,
-    });
-    const fit = new FitAddon();
-    terminal.loadAddon(fit);
-    terminal.open(host.current);
-    fit.fit();
-    const socket = new WebSocket(`${wsBase}/instances/${instanceId}/terminal`, [
-      `localec2-token.${token ?? ""}`,
-    ]);
-    socket.binaryType = "arraybuffer";
-    const sendSize = () => {
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(
-          JSON.stringify({
-            type: "resize",
-            rows: terminal.rows,
-            cols: terminal.cols,
-          }),
-        );
-      }
-    };
-    socket.onopen = () => {
-      setState("Connected");
-      terminal.focus();
-      sendSize();
-    };
-    socket.onmessage = (event) =>
-      terminal.write(
-        event.data instanceof ArrayBuffer
-          ? new Uint8Array(event.data)
-          : event.data,
-      );
-    socket.onclose = () => setState("Disconnected");
-    const input = terminal.onData((data) => {
-      if (socket.readyState === WebSocket.OPEN)
-        socket.send(JSON.stringify({ type: "input", data }));
-    });
-    const resize = () => {
-      fit.fit();
-      sendSize();
-    };
-    window.addEventListener("resize", resize);
-    return () => {
-      input.dispose();
-      socket.close();
-      terminal.dispose();
-      window.removeEventListener("resize", resize);
-    };
-  }, [instanceId, item?.status, token]);
-
   return (
     <>
       <PageHeader
         title={`Terminal · ${item?.display_name ?? ""}`}
-      description="Commands run inside this Multipass VM, never on the Ubuntu host."
-        action={
-          <Status value={state === "Connected" ? "RUNNING" : "PENDING"} />
-        }
+        description="Distributed interactive terminal streaming is disabled until a reverse agent PTY channel is configured."
+        action={<Status value="DISABLED" />}
       />
       {item && item.status !== "RUNNING" ? (
         <Card className="stopped">
           <h2>Instance is stopped</h2>
           <p>Start it before opening a terminal session.</p>
         </Card>
-      ) : (
-        <div className="terminal" ref={host} />
-      )}
+      ) : <Card className="stopped"><h2>Connect with SSH</h2><p>Use the downloaded private key from a network that can reach the selected node's guest network.</p><code>ssh {item?.ssh_username ?? "vagrant"}@{item?.ipv4_address ?? "&lt;instance-ip&gt;"}</code></Card>}
     </>
   );
 }

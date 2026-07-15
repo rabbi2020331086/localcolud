@@ -14,17 +14,6 @@ Require-Command 'python' 'Install Python 3.11 or newer and enable Add Python to 
 Require-Command 'node' 'Install Node.js 20 or newer from https://nodejs.org/.'
 Require-Command 'npm' 'Install Node.js 20 or newer from https://nodejs.org/.'
 
-$multipassCommand = Get-Command 'multipass.exe' -ErrorAction SilentlyContinue
-if (-not $multipassCommand) {
-    $installedMultipass = Join-Path $env:ProgramFiles 'Multipass\bin\multipass.exe'
-    if (Test-Path $installedMultipass) {
-        $multipassCommand = Get-Item $installedMultipass
-    }
-}
-if (-not $multipassCommand) {
-    Write-Warning 'Multipass is not installed or is not on PATH. Setup can continue, but launching VMs will be disabled until Canonical Multipass is installed.'
-}
-
 $pythonVersion = & python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
 if ([version]$pythonVersion -lt [version]'3.11') {
     throw "Python 3.11 or newer is required. Found Python $pythonVersion."
@@ -114,7 +103,4 @@ finally {
 
 Write-Host ''
 Write-Host 'Setup complete. MongoDB Atlas is used directly; Docker is not required.' -ForegroundColor Green
-if (-not $multipassCommand) {
-    Write-Host 'VM prerequisite: install Canonical Multipass, reopen PowerShell, and confirm: multipass.exe version' -ForegroundColor Yellow
-}
 Write-Host 'Next command: .\start-windows.ps1' -ForegroundColor Cyan

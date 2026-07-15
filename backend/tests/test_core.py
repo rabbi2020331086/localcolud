@@ -1,12 +1,18 @@
+import base64
+import re
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
+from starlette.requests import Request
+
+from app.agent import NodeExecutor
 from app.api.dependencies import has_platform_admin_access
+from app.api.routes.auth import refresh_cookie_name
 from app.api.routes.nodes import observed_status
 from app.core.security import create_jwt, decode_jwt, hash_password, verify_password
 from app.infrastructure.models import CloudNode, Instance, LoadBalancer, NodeStatus, User
-from app.infrastructure.vm import FakeProvider, VagrantProvider, safe_name
+from app.infrastructure.vm import safe_name
 from app.services import load_balancing
 
 
@@ -26,15 +32,64 @@ def test_safe_name():
     assert value.startswith("localec2-12345678-my-dev-vm-") and " " not in value
 
 
-def test_vagrant_provider_renders_libvirt_machine(tmp_path: Path):
-    provider = VagrantProvider(root=tmp_path)
+def test_admin_and_customer_refresh_sessions_are_separate():
+    customer = Request({"type": "http", "headers": []})
+    admin = Request({"type": "http", "headers": [(b"x-localec2-client", b"admin")]})
+    assert refresh_cookie_name(customer) == "localec2_refresh"
+    assert refresh_cookie_name(admin) == "localec2_admin_refresh"
 
-    content = provider.render_vagrantfile("web-01", "24.04", 4, 8192, None)
+
+def test_node_agent_renders_libvirt_machine(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_EC2_STORAGE_ROOT", str(tmp_path))
+    provider = NodeExecutor()
+
+    content = provider.render_vagrantfile(
+        {
+            "name": "web-01",
+            "image": "24.04",
+            "cpu_count": 4,
+            "memory_mb": 8192,
+            "disk_gb": 25,
+            "public_key": "ssh-ed25519 AAAATEST portfolio@example",
+        }
+    )
 
     assert 'config.vm.box = "bento/ubuntu-24.04"' in content
     assert 'config.vm.provider "libvirt"' in content
+    assert 'config.vm.synced_folder ".", "/vagrant", disabled: true' in content
+    assert 'provider.driver = "kvm"' in content
+    assert 'provider.cpu_mode = "host-passthrough"' in content
+    assert 'provider.loader = "/usr/share/OVMF/OVMF_CODE.fd"' in content
     assert "provider.cpus = 4" in content
     assert "provider.memory = 8192" in content
+    assert "provider.machine_virtual_size = 25" in content
+    encoded = re.search(r"printf %s ([A-Za-z0-9+/=]+) \|", content)
+    assert encoded and "authorized_keys" in base64.b64decode(encoded.group(1)).decode()
+
+    assert provider.image_boxes["debian-12"] == "bento/debian-12"
+
+
+def test_node_agent_retries_transient_download_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_EC2_STORAGE_ROOT", str(tmp_path))
+    provider = NodeExecutor()
+    root = provider.instance_root("web-01")
+    root.mkdir(parents=True)
+    outcomes = iter(
+        [
+            SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="Could not resolve host: vagrantcloud-files-production.example",
+            ),
+            SimpleNamespace(returncode=0, stdout="downloaded", stderr=""),
+        ]
+    )
+    delays: list[int] = []
+    monkeypatch.setattr("app.agent.subprocess.run", lambda *args, **kwargs: next(outcomes))
+    monkeypatch.setattr("app.agent.time.sleep", delays.append)
+
+    assert provider.run(root, "up") == "downloaded"
+    assert delays == [5]
 
 
 def test_node_observed_status_uses_approval_drain_and_heartbeat_age():
@@ -61,29 +116,6 @@ def test_platform_admin_is_an_explicit_role():
     assert not has_platform_admin_access(user)
     user.is_platform_admin = True
     assert has_platform_admin_access(user)
-
-
-async def test_fake_provider_clones_machine_images():
-    provider = FakeProvider()
-    source = await provider.launch("source", "24.04", 1, 1024, 10)
-    await provider.stop(source.name)
-
-    clone = await provider.clone(source.name, "clone", 2, 2048, 15)
-
-    assert clone.name == "clone"
-    assert clone.state == "Running"
-    assert (clone.cpu_count, clone.memory_mb, clone.disk_gb) == (2, 2048, 15)
-
-
-async def test_fake_provider_hibernates_and_resumes_instance():
-    provider = FakeProvider()
-    instance = await provider.launch("work", "24.04", 1, 1024, 10)
-
-    await provider.suspend(instance.name)
-    assert instance.state == "Suspended"
-
-    await provider.start(instance.name)
-    assert instance.state == "Running"
 
 
 async def test_load_balancer_round_robin_selects_each_healthy_target():

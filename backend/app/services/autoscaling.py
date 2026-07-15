@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections import defaultdict, deque
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
@@ -16,10 +17,12 @@ from app.infrastructure.models import (
     OperationType,
     ScalingEvent,
 )
-from app.infrastructure.vm import provider, safe_name
+from app.infrastructure.vm import safe_name
+from app.services import node_jobs, scheduler
 
 samples: dict[UUID, deque[float]] = defaultdict(lambda: deque(maxlen=20))
 worker_task: asyncio.Task[None] | None = None
+log = logging.getLogger("localec2.autoscaling")
 
 
 async def average_cpu(instances: list[Instance]) -> float | None:
@@ -28,14 +31,8 @@ async def average_cpu(instances: list[Instance]) -> float | None:
         if instance.status != InstanceStatus.RUNNING:
             continue
         try:
-            output = await provider.exec(
-                instance.multipass_name,
-                [
-                    "sh",
-                    "-lc",
-                    CPU_PERCENT_COMMAND,
-                ],
-            )
+            scheduler.require_distributed(instance)
+            output = await node_jobs.remote_exec(instance, CPU_PERCENT_COMMAND)
             values.append(float(output.strip() or 0))
         except Exception:
             continue
@@ -60,6 +57,7 @@ async def scale_out(group: AutoScalingGroup, current_size: int, reason: str) -> 
         memory_mb=template.memory_mb,
         disk_gb=template.disk_gb,
         key_pair_id=template.key_pair_id,
+        availability_zone="pending-placement",
     )
     operation = Operation(
         user_id=group.user_id,
@@ -73,6 +71,7 @@ async def scale_out(group: AutoScalingGroup, current_size: int, reason: str) -> 
     )
     event = ScalingEvent(
         autoscaling_group_id=group.id,
+        operation_id=operation.id,
         action="SCALE_OUT",
         previous_size=current_size,
         new_size=current_size + 1,
@@ -81,8 +80,31 @@ async def scale_out(group: AutoScalingGroup, current_size: int, reason: str) -> 
         status="QUEUED",
     )
     await database.instances.insert_one(to_document(instance))
-    await database.operations.insert_one(to_document(operation))
-    await database.scaling_events.insert_one(to_document(event))
+    try:
+        instance = await scheduler.reserve_instance(database, instance)
+        await database.scaling_events.insert_one(to_document(event))
+        await database.operations.insert_one(to_document(operation))
+    except Exception as exc:
+        current = from_document(
+            Instance, await database.instances.find_one({"_id": str(instance.id)})
+        )
+        if current:
+            await scheduler.release_instance_capacity(database, current)
+        await database.instances.delete_one({"_id": str(instance.id)})
+        failure = await database.scaling_events.update_one(
+            {"_id": str(event.id)},
+            {
+                "$set": {
+                    "status": "FAILED",
+                    "reason": f"{reason}: {str(exc)[:300]}",
+                }
+            },
+        )
+        if not failure.matched_count:
+            event.status = "FAILED"
+            event.reason = f"{reason}: {str(exc)[:300]}"
+            await database.scaling_events.insert_one(to_document(event))
+        return
     await database.autoscaling_groups.update_one(
         {"_id": str(group.id)},
         {
@@ -118,6 +140,7 @@ async def scale_in(group: AutoScalingGroup, instances: list[Instance], reason: s
     )
     event = ScalingEvent(
         autoscaling_group_id=group.id,
+        operation_id=operation.id,
         action="SCALE_IN",
         previous_size=len(instances),
         new_size=len(instances) - 1,
@@ -125,8 +148,8 @@ async def scale_in(group: AutoScalingGroup, instances: list[Instance], reason: s
         average_cpu=samples[group.id][-1] if samples[group.id] else None,
         status="QUEUED",
     )
-    await database.operations.insert_one(to_document(operation))
     await database.scaling_events.insert_one(to_document(event))
+    await database.operations.insert_one(to_document(operation))
     await database.autoscaling_groups.update_one(
         {"_id": str(group.id)},
         {
@@ -186,9 +209,16 @@ async def evaluate_group(group: AutoScalingGroup) -> None:
 
 async def autoscaling_loop() -> None:
     while True:
-        documents = await database.autoscaling_groups.find({"enabled": True}).to_list(length=None)
-        for document in documents:
-            group = from_document(AutoScalingGroup, document)
-            if group:
-                await evaluate_group(group)
+        try:
+            documents = await database.autoscaling_groups.find({"enabled": True}).to_list(
+                length=None
+            )
+            for document in documents:
+                group = from_document(AutoScalingGroup, document)
+                if group:
+                    await evaluate_group(group)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Autoscaling worker retrying after control-plane error: %s", exc)
         await asyncio.sleep(settings.autoscaling_interval_seconds)

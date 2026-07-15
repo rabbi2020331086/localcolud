@@ -15,19 +15,27 @@ from app.schemas import LoginIn, PasswordChangeIn, RegisterIn, TokenOut, UserOut
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
-def cookie(response: Response, value: str) -> None:
+def refresh_cookie_name(request: Request) -> str:
+    return (
+        "localec2_admin_refresh"
+        if request.headers.get("x-localec2-client", "").lower() == "admin"
+        else "localec2_refresh"
+    )
+
+
+def cookie(request: Request, response: Response, value: str) -> None:
     response.set_cookie(
-        "localec2_refresh",
+        refresh_cookie_name(request),
         value,
         httponly=True,
         secure=settings.app_env == "production",
-        samesite="lax",
+        samesite="none" if settings.app_env == "production" else "lax",
         max_age=settings.refresh_token_days * 86400,
         path=f"{settings.api_prefix}/auth",
     )
 
 
-async def issue(database: Database, user: User, response: Response) -> TokenOut:
+async def issue(database: Database, user: User, request: Request, response: Response) -> TokenOut:
     jti = str(uuid4())
     raw = create_jwt(str(user.id), "refresh", timedelta(days=settings.refresh_token_days), jti)
     refresh = RefreshToken(
@@ -37,7 +45,7 @@ async def issue(database: Database, user: User, response: Response) -> TokenOut:
         expires_at=datetime.now(UTC) + timedelta(days=settings.refresh_token_days),
     )
     await database.refresh_tokens.insert_one(to_document(refresh))
-    cookie(response, raw)
+    cookie(request, response, raw)
     return TokenOut(
         access_token=create_jwt(
             str(user.id), "access", timedelta(minutes=settings.access_token_minutes)
@@ -49,7 +57,9 @@ async def issue(database: Database, user: User, response: Response) -> TokenOut:
 
 
 @router.post("/register", response_model=TokenOut, status_code=201)
-async def register(data: RegisterIn, response: Response, database: Database) -> TokenOut:
+async def register(
+    data: RegisterIn, request: Request, response: Response, database: Database
+) -> TokenOut:
     user = User(
         email=data.email.lower(),
         display_name=data.display_name.strip(),
@@ -63,17 +73,19 @@ async def register(data: RegisterIn, response: Response, database: Database) -> 
         await database.users.insert_one(to_document(user))
     except DuplicateKeyError:
         raise HTTPException(409, "An account with this email already exists") from None
-    return await issue(database, user, response)
+    return await issue(database, user, request, response)
 
 
 @router.post("/login", response_model=TokenOut)
-async def login(data: LoginIn, response: Response, database: Database) -> TokenOut:
+async def login(
+    data: LoginIn, request: Request, response: Response, database: Database
+) -> TokenOut:
     identifier = data.email.strip().lower()
     email = "admin@localec2.local" if identifier == "admin" else identifier
     user = from_document(User, await database.users.find_one({"email": email}))
     if not user or not verify_password(data.password, user.password_hash):
         raise HTTPException(401, "Invalid email or password")
-    return await issue(database, user, response)
+    return await issue(database, user, request, response)
 
 
 @router.post("/change-password", status_code=204)
@@ -93,7 +105,7 @@ async def change_password(data: PasswordChangeIn, user: CurrentUser, database: D
 
 @router.post("/refresh", response_model=TokenOut)
 async def refresh(request: Request, response: Response, database: Database) -> TokenOut:
-    raw = request.cookies.get("localec2_refresh")
+    raw = request.cookies.get(refresh_cookie_name(request))
     try:
         payload = decode_jwt(raw or "", "refresh")
         row = from_document(
@@ -113,18 +125,19 @@ async def refresh(request: Request, response: Response, database: Database) -> T
     user = from_document(User, await database.users.find_one({"_id": str(row.user_id)}))
     if not user:
         raise HTTPException(401, "Refresh session is invalid")
-    return await issue(database, user, response)
+    return await issue(database, user, request, response)
 
 
 @router.post("/logout", status_code=204)
 async def logout(request: Request, response: Response, database: Database) -> None:
-    raw = request.cookies.get("localec2_refresh")
+    name = refresh_cookie_name(request)
+    raw = request.cookies.get(name)
     if raw:
         await database.refresh_tokens.update_one(
             {"token_hash": token_hash(raw), "revoked_at": None},
             {"$set": {"revoked_at": datetime.now(UTC)}},
         )
-    response.delete_cookie("localec2_refresh", path=f"{settings.api_prefix}/auth")
+    response.delete_cookie(name, path=f"{settings.api_prefix}/auth")
 
 
 @router.get("/me", response_model=UserOut)

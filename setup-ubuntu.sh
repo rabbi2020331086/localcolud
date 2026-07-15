@@ -48,10 +48,6 @@ if [[ "$PROJECT_ONLY" == false ]]; then
     sudo npm install --global "pnpm@$REQUIRED_PNPM_VERSION"
   fi
 
-  if ! command -v multipass >/dev/null 2>&1; then
-    sudo snap install multipass
-  fi
-  sudo usermod -aG multipass "$USER" 2>/dev/null || true
 fi
 
 command -v node >/dev/null 2>&1 || { echo "Node.js is missing." >&2; exit 1; }
@@ -76,7 +72,6 @@ replacements = {
         "PRIVATE_KEY_ENCRYPTION_KEY="
         + base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
     ),
-    "MULTIPASS_EXECUTABLE=multipass.exe": "MULTIPASS_EXECUTABLE=multipass",
 }
 for old, new in replacements.items():
     text = text.replace(old, new)
@@ -92,4 +87,4 @@ pnpm --dir "$ROOT/admin-frontend" install --frozen-lockfile
 echo
 echo "Setup complete. Configure MONGODB_URI in backend/.env, then run:"
 echo "  ./start-ubuntu.sh"
-echo "If this was your first Multipass install, log out and back in if access is denied."
+echo "Compute hosts are installed separately from Admin > Infrastructure."

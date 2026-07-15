@@ -4,20 +4,31 @@ from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Response
 from fastapi.responses import FileResponse
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from app.api.dependencies import PlatformOperator
 from app.core.config import settings
 from app.core.security import opaque_token, token_hash
 from app.infrastructure.database import Database, from_document, from_documents, to_document
-from app.infrastructure.models import CloudNode, NodeStatus
-from app.schemas import NodeCreate, NodeEnrollmentOut, NodeHeartbeat, NodeOut, NodeUpdate
+from app.infrastructure.models import CloudNode, NodeJob, NodeJobStatus, NodeStatus
+from app.schemas import (
+    AgentJobOut,
+    AgentJobResult,
+    NodeCreate,
+    NodeEnrollmentOut,
+    NodeHeartbeat,
+    NodeOut,
+    NodeUpdate,
+)
+from app.services.node_jobs import reap_expired_leases
 
 router = APIRouter(prefix="/nodes", tags=["Cloud nodes"])
 agent = APIRouter(prefix="/agent/nodes", tags=["Node agent"])
 agent_files = APIRouter(prefix="/agent", tags=["Node agent"])
+REQUIRED_COMPUTE_CAPABILITIES = {"jobs", "vagrant", "libvirt", "kvm"}
 
 
 def observed_status(node: CloudNode, now: datetime | None = None) -> NodeStatus:
@@ -97,8 +108,40 @@ async def update_node(
     changes = data.model_dump(exclude_none=True)
     if not changes:
         return output(node)
-    if changes.get("approved") is True and not node.last_seen_at:
-        raise HTTPException(409, "Connect the node agent before approving this host")
+    if (
+        "availability_zone" in changes
+        and changes["availability_zone"] != node.availability_zone
+        and await database.instances.find_one(
+            {"node_id": str(node.id), "deleted_at": None, "capacity_reserved": True}
+        )
+    ):
+        raise HTTPException(409, "Drain and terminate workloads before moving a node to a new zone")
+    if changes.get("approved") is True:
+        if not node.last_seen_at:
+            raise HTTPException(409, "Connect the node agent before approving this host")
+        missing = REQUIRED_COMPUTE_CAPABILITIES.difference(node.capabilities)
+        if node.provider_name.value != "vagrant-libvirt" or missing:
+            detail = ", ".join(sorted(missing)) or "vagrant-libvirt provider"
+            raise HTTPException(
+                409,
+                f"Node cannot execute distributed VM jobs; missing capability: {detail}. "
+                "Run Setup / reconnect to install the current agent.",
+            )
+    if changes.get("schedulable") is True and node.approved:
+        missing = REQUIRED_COMPUTE_CAPABILITIES.difference(node.capabilities)
+        if missing:
+            raise HTTPException(409, "Upgrade the node agent before enabling scheduling")
+    limits = {
+        "cpu_reserved": (node.cpu_total, node.cpu_allocated),
+        "memory_reserved_mb": (node.memory_total_mb, node.memory_allocated_mb),
+        "storage_reserved_gb": (node.storage_total_gb, node.storage_allocated_gb),
+    }
+    for field, (total, allocated) in limits.items():
+        if field in changes and total and int(changes[field]) + allocated >= total:
+            raise HTTPException(
+                422,
+                f"{field} plus allocated capacity must be lower than the reported total",
+            )
     changes["updated_at"] = datetime.now(UTC)
     if changes.get("approved") is False:
         changes["status"] = NodeStatus.PENDING
@@ -145,6 +188,105 @@ async def heartbeat(
     }
     await database.cloud_nodes.update_one({"_id": str(node.id)}, {"$set": changes})
     return output(CloudNode.model_validate({**node.model_dump(), **changes}))
+
+
+@agent.post("/{node_id}/jobs/claim", response_model=AgentJobOut, responses={204: {}})
+async def claim_job(
+    node_id: UUID,
+    database: Database,
+    authorization: Annotated[str | None, Header()] = None,
+) -> AgentJobOut | Response:
+    node = await authenticated_node(database, node_id, authorization)
+    if not node.approved:
+        raise HTTPException(403, "Node must be approved before it can claim jobs")
+    await reap_expired_leases()
+    now = datetime.now(UTC)
+    document = await database.node_jobs.find_one_and_update(
+        {"node_id": str(node.id), "status": NodeJobStatus.QUEUED},
+        {
+            "$set": {
+                "status": NodeJobStatus.LEASED,
+                "started_at": now,
+                "lease_expires_at": now + timedelta(seconds=settings.node_job_lease_seconds),
+                "updated_at": now,
+            },
+            "$inc": {"attempts": 1},
+        },
+        sort=[("created_at", 1)],
+        return_document=ReturnDocument.AFTER,
+    )
+    job = from_document(NodeJob, document)
+    if not job:
+        return Response(status_code=204)
+    return AgentJobOut.model_validate(job)
+
+
+@agent.post("/{node_id}/jobs/{job_id}/renew", status_code=204)
+async def renew_job(
+    node_id: UUID,
+    job_id: UUID,
+    database: Database,
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    node = await authenticated_node(database, node_id, authorization)
+    now = datetime.now(UTC)
+    result = await database.node_jobs.update_one(
+        {
+            "_id": str(job_id),
+            "node_id": str(node.id),
+            "status": NodeJobStatus.LEASED,
+        },
+        {
+            "$set": {
+                "lease_expires_at": now + timedelta(seconds=settings.node_job_lease_seconds),
+                "updated_at": now,
+            }
+        },
+    )
+    if not result.modified_count:
+        raise HTTPException(409, "Node job lease is no longer active")
+
+
+@agent.post("/{node_id}/jobs/{job_id}/complete", status_code=204)
+async def complete_job(
+    node_id: UUID,
+    job_id: UUID,
+    data: AgentJobResult,
+    database: Database,
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    node = await authenticated_node(database, node_id, authorization)
+    now = datetime.now(UTC)
+    status = NodeJobStatus.SUCCEEDED if data.succeeded else NodeJobStatus.FAILED
+    result = await database.node_jobs.update_one(
+        {
+            "_id": str(job_id),
+            "node_id": str(node.id),
+            "status": NodeJobStatus.LEASED,
+        },
+        {
+            "$set": {
+                "status": status,
+                "result_payload": data.result_payload,
+                "error_message": None if data.succeeded else data.error_message,
+                "lease_expires_at": None,
+                "finished_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+    if result.modified_count:
+        return
+    existing_job = from_document(
+        NodeJob,
+        await database.node_jobs.find_one({"_id": str(job_id), "node_id": str(node.id)}),
+    )
+    if existing_job and existing_job.status in (
+        NodeJobStatus.SUCCEEDED,
+        NodeJobStatus.FAILED,
+    ):
+        return
+    raise HTTPException(409, "Node job is not leased to this agent")
 
 
 @agent_files.get("/install.sh", response_class=FileResponse, include_in_schema=False)

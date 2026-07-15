@@ -23,6 +23,12 @@ def member_output(user: User) -> TeamMemberOut:
 @router.get("/overview")
 async def overview(admin: PlatformOperator, database: Database) -> dict[str, object]:
     nodes = from_documents(CloudNode, await database.cloud_nodes.find({}).to_list(None))
+    eligible = [
+        node
+        for node in nodes
+        if observed_status(node).value == "ONLINE"
+        and {"jobs", "vagrant", "libvirt", "kvm"}.issubset(node.capabilities)
+    ]
     instances = from_documents(
         Instance, await database.instances.find({"deleted_at": None}).to_list(None)
     )
@@ -39,13 +45,17 @@ async def overview(admin: PlatformOperator, database: Database) -> dict[str, obj
             item.status.value in {"PENDING", "RUNNING"} for item in operations
         ),
         "failed_operations": sum(item.status.value == "FAILED" for item in operations),
-        "cpu_total": sum(node.cpu_total for node in nodes),
-        "cpu_allocated": sum(node.cpu_allocated for node in nodes),
-        "memory_total_mb": sum(node.memory_total_mb for node in nodes),
-        "memory_allocated_mb": sum(node.memory_allocated_mb for node in nodes),
-        "storage_total_gb": sum(node.storage_total_gb for node in nodes),
-        "storage_allocated_gb": sum(node.storage_allocated_gb for node in nodes),
-        "zones": sorted({node.availability_zone for node in nodes}),
+        "cpu_total": sum(max(0, node.cpu_total - node.cpu_reserved) for node in eligible),
+        "cpu_allocated": sum(node.cpu_allocated for node in eligible),
+        "memory_total_mb": sum(
+            max(0, node.memory_total_mb - node.memory_reserved_mb) for node in eligible
+        ),
+        "memory_allocated_mb": sum(node.memory_allocated_mb for node in eligible),
+        "storage_total_gb": sum(
+            max(0, node.storage_total_gb - node.storage_reserved_gb) for node in eligible
+        ),
+        "storage_allocated_gb": sum(node.storage_allocated_gb for node in eligible),
+        "zones": sorted({node.availability_zone for node in eligible}),
     }
 
 

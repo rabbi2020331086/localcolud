@@ -104,6 +104,7 @@ class InstanceCreate(BaseModel):
     instance_type: str = "t2.small"
     key_pair_id: UUID | None = None
     security_group_ids: list[UUID] = Field(default_factory=list, max_length=5)
+    availability_zone: str | None = Field(default=None, max_length=80, pattern=r"^[a-z0-9.-]+$")
 
     @model_validator(mode="after")
     def apply_instance_type(self) -> "InstanceCreate":
@@ -141,8 +142,7 @@ class InstanceOut(OrmModel):
     key_pair_id: UUID | None
     security_group_ids: list[UUID]
     autoscaling_group_id: UUID | None
-    node_id: UUID | None
-    provider_name: ComputeProvider
+    availability_zone: str
     last_error: str | None
     created_at: datetime
     updated_at: datetime
@@ -161,6 +161,13 @@ class NodeCreate(BaseModel):
     )
     provider_name: ComputeProvider = ComputeProvider.VAGRANT_LIBVIRT
     labels: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("provider_name")
+    @classmethod
+    def distributed_provider_only(cls, value: ComputeProvider) -> ComputeProvider:
+        if value != ComputeProvider.VAGRANT_LIBVIRT:
+            raise ValueError("Compute nodes must use Vagrant with libvirt/KVM")
+        return value
 
     @field_validator("labels")
     @classmethod
@@ -195,6 +202,9 @@ class NodeUpdate(BaseModel):
         default=None, min_length=1, max_length=80, pattern=r"^[a-z0-9.-]+$"
     )
     labels: dict[str, str] | None = None
+    cpu_reserved: int | None = Field(default=None, ge=0, le=4096)
+    memory_reserved_mb: int | None = Field(default=None, ge=0)
+    storage_reserved_gb: int | None = Field(default=None, ge=0)
 
     @field_validator("labels")
     @classmethod
@@ -214,10 +224,13 @@ class NodeOut(OrmModel):
     hostname: str | None
     management_address: str | None
     cpu_total: int
+    cpu_reserved: int
     cpu_allocated: int
     memory_total_mb: int
+    memory_reserved_mb: int
     memory_allocated_mb: int
     storage_total_gb: int
+    storage_reserved_gb: int
     storage_allocated_gb: int
     labels: dict[str, str]
     capabilities: list[str]
@@ -230,6 +243,27 @@ class NodeOut(OrmModel):
 
 class NodeEnrollmentOut(NodeOut):
     enrollment_token: str
+
+
+class ZoneCapacityOut(BaseModel):
+    availability_zone: str
+    available: bool
+
+
+class AgentJobOut(OrmModel):
+    id: UUID
+    node_id: UUID
+    instance_id: UUID | None
+    job_type: str
+    payload: dict[str, object]
+    attempts: int
+    created_at: datetime
+
+
+class AgentJobResult(BaseModel):
+    succeeded: bool
+    result_payload: dict[str, object] = Field(default_factory=dict)
+    error_message: str | None = Field(default=None, max_length=4000)
 
 
 class OperationOut(OrmModel):

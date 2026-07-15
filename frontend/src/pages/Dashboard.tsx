@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { Card, Loading, PageHeader, Status } from "../components/ui";
 import { useGroups, useInstances, useOperations } from "../hooks/data";
+import type { ZoneCapacity } from "../types";
 export function Dashboard() {
   const instances = useInstances();
   const operations = useOperations();
@@ -11,26 +12,23 @@ export function Dashboard() {
     queryKey: ["health"],
     queryFn: () =>
       api
-        .get<{
-          status: string;
-          multipass: boolean;
-        }>("http://localhost:8000/health/readiness")
+        .get<ZoneCapacity[]>("/instances/capacity/zones")
         .then((r) => r.data),
     refetchInterval: 15000,
   });
   if (instances.isLoading) return <Loading />;
   const all = instances.data ?? [];
+  const available = health.data?.some((zone) => zone.available);
   return (
     <>
       <PageHeader
         title="Overview"
         description="Your local cloud at a glance."
       />
-      {health.data && !health.data.multipass && (
+      {health.data && !available && (
         <div className="provider-alert">
           <CloudOff />
-          Multipass is unavailable. Install or start Multipass to use VM
-          actions.
+          No approved capacity is currently available in any availability zone.
         </div>
       )}
       <div className="summary">
@@ -79,16 +77,16 @@ export function Dashboard() {
           ))}
         </Card>
         <Card>
-          <h2>Provider</h2>
+          <h2>Cloud capacity</h2>
           <div className="provider-state">
-            <span className={health.data?.multipass ? "orb good" : "orb"} />
+            <span className={available ? "orb good" : "orb"} />
             <div>
               <strong>
-                {health.data?.multipass
-                  ? "Multipass ready"
-                  : "Multipass unavailable"}
+                {available
+                  ? `${(health.data ?? []).filter((zone) => zone.available).length} availability zones ready`
+                  : "No compute nodes ready"}
               </strong>
-                <p>VMs run locally on this Ubuntu computer.</p>
+                <p>Placement is managed by the platform operations team.</p>
             </div>
           </div>
         </Card>

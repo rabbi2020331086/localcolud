@@ -34,11 +34,14 @@ export type Instance = {
   key_pair_id: string | null;
   security_group_ids: string[];
   autoscaling_group_id: string | null;
-  node_id: string | null;
-  provider_name: "multipass" | "vagrant-libvirt";
+  availability_zone: string;
   last_error: string | null;
   created_at: string;
   updated_at: string;
+};
+export type ZoneCapacity = {
+  availability_zone: string;
+  available: boolean;
 };
 export type Operation = {
   id: string;

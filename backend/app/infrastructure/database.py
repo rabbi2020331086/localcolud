@@ -67,6 +67,76 @@ def from_documents(model_type: type[ModelType], documents: Iterable[Document]) -
 
 async def initialize_database() -> None:
     await database.command("ping")
+    # Older installations did not persist placement or host-reservation fields.
+    # Set explicit legacy/safe values before models are read so an upgrade can
+    # never reinterpret a control-plane Multipass VM as distributed capacity.
+    await database.instances.update_many(
+        {"availability_zone": {"$exists": False}},
+        {"$set": {"availability_zone": "legacy-unassigned"}},
+    )
+    await database.instances.update_many(
+        {"capacity_reserved": {"$exists": False}},
+        {"$set": {"capacity_reserved": False}},
+    )
+    await database.instances.update_many(
+        {"provider_name": {"$exists": False}},
+        {"$set": {"provider_name": "multipass"}},
+    )
+    await database.cloud_nodes.update_many(
+        {},
+        [
+            {
+                "$set": {
+                    "cpu_reserved": {"$ifNull": ["$cpu_reserved", 1]},
+                    "memory_reserved_mb": {"$ifNull": ["$memory_reserved_mb", 1024]},
+                    "storage_reserved_gb": {"$ifNull": ["$storage_reserved_gb", 10]},
+                }
+            }
+        ],
+    )
+    # Allocation counters are derived state. Rebuild them from instance
+    # reservations on startup to repair interrupted placement/release writes.
+    await database.cloud_nodes.update_many(
+        {},
+        {
+            "$set": {
+                "cpu_allocated": 0,
+                "memory_allocated_mb": 0,
+                "storage_allocated_gb": 0,
+            },
+            "$unset": {"placement_pending": ""},
+        },
+    )
+    allocations = await database.instances.aggregate(
+        [
+            {
+                "$match": {
+                    "deleted_at": None,
+                    "capacity_reserved": True,
+                    "node_id": {"$type": "string"},
+                }
+            },
+            {
+                "$group": {
+                    "_id": "$node_id",
+                    "cpu": {"$sum": "$cpu_count"},
+                    "memory": {"$sum": "$memory_mb"},
+                    "storage": {"$sum": "$disk_gb"},
+                }
+            },
+        ]
+    )
+    async for allocation in allocations:
+        await database.cloud_nodes.update_one(
+            {"_id": allocation["_id"]},
+            {
+                "$set": {
+                    "cpu_allocated": allocation["cpu"],
+                    "memory_allocated_mb": allocation["memory"],
+                    "storage_allocated_gb": allocation["storage"],
+                }
+            },
+        )
     await database.users.create_indexes([IndexModel("email", unique=True, name="uq_users_email")])
     if settings.app_env != "production" and settings.development_default_admin:
         default_email = "admin@localec2.local"
@@ -104,6 +174,14 @@ async def initialize_database() -> None:
             IndexModel([("user_id", ASCENDING), ("name", ASCENDING)], unique=True),
             IndexModel("agent_token_hash", unique=True),
             IndexModel([("status", ASCENDING), ("last_seen_at", DESCENDING)]),
+        ]
+    )
+    await database.node_jobs.create_indexes(
+        [
+            IndexModel([("node_id", ASCENDING), ("status", ASCENDING), ("created_at", ASCENDING)]),
+            IndexModel("operation_id"),
+            IndexModel("instance_id"),
+            IndexModel("lease_expires_at"),
         ]
     )
     await database.operations.create_indexes(

@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import shlex
 from collections import defaultdict
 from datetime import UTC, datetime
 from uuid import UUID
@@ -7,7 +9,7 @@ from app.core.config import settings
 from app.infrastructure.database import database, from_documents
 from app.infrastructure.metrics import CPU_PERCENT_COMMAND
 from app.infrastructure.models import Instance, InstanceStatus, LoadBalancer
-from app.infrastructure.vm import provider
+from app.services import node_jobs, scheduler
 
 health: dict[tuple[UUID, UUID], bool] = {}
 cpu_loads: dict[tuple[UUID, UUID], float] = {}
@@ -16,6 +18,7 @@ round_robin_positions: dict[UUID, int] = defaultdict(int)
 last_checks: dict[UUID, float] = {}
 selection_lock = asyncio.Lock()
 worker_task: asyncio.Task[None] | None = None
+log = logging.getLogger("localec2.load_balancing")
 
 
 async def group_targets(load_balancer: LoadBalancer) -> list[Instance]:
@@ -37,8 +40,17 @@ async def group_targets(load_balancer: LoadBalancer) -> list[Instance]:
 async def check_target(lb: LoadBalancer, target: Instance) -> None:
     key = (lb.id, target.id)
     try:
-        output = await provider.exec(target.multipass_name, ["sh", "-lc", CPU_PERCENT_COMMAND])
-        cpu_loads[key] = float(output.strip() or 0)
+        scheduler.require_distributed(target)
+        url = f"http://127.0.0.1:{lb.target_port}{lb.health_check_path}"
+        probe = "python3 -c " + shlex.quote(
+            "import urllib.request; "
+            f"response=urllib.request.urlopen({url!r}, timeout=5); "
+            "assert 200 <= response.status < 400"
+        )
+        output = await node_jobs.remote_exec(
+            target, f"{probe} && {CPU_PERCENT_COMMAND}", timeout=15
+        )
+        cpu_loads[key] = float(output.strip().splitlines()[-1] or 0)
         health[key] = True
     except Exception:
         health[key] = False
@@ -101,10 +113,10 @@ async def release_target(lb_id: UUID, instance_id: UUID) -> None:
 
 async def health_loop() -> None:
     while True:
-        documents = await database.load_balancers.find({"enabled": True}).to_list(None)
-        load_balancers = from_documents(LoadBalancer, documents)
-        for lb in load_balancers:
-            try:
+        try:
+            documents = await database.load_balancers.find({"enabled": True}).to_list(None)
+            load_balancers = from_documents(LoadBalancer, documents)
+            for lb in load_balancers:
                 elapsed = asyncio.get_running_loop().time() - last_checks.get(lb.id, 0)
                 if elapsed < lb.health_check_interval_seconds:
                     continue
@@ -112,7 +124,8 @@ async def health_loop() -> None:
                 await database.load_balancers.update_one(
                     {"_id": str(lb.id)}, {"$set": {"updated_at": datetime.now(UTC)}}
                 )
-            except Exception:
-                # One bad target or database record must not stop all health checks.
-                continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Load-balancer worker retrying after control-plane error: %s", exc)
         await asyncio.sleep(settings.load_balancer_health_interval_seconds)

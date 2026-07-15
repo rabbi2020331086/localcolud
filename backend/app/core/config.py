@@ -1,7 +1,4 @@
-import os
-import shutil
 from functools import lru_cache
-from pathlib import Path
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,38 +21,27 @@ class Settings(BaseSettings):
     admin_frontend_origin: str = "http://localhost:5174"
     platform_admin_email: str = ""
     development_default_admin: bool = True
-    multipass_executable: str = "multipass"
-    vagrant_executable: str = "vagrant"
-    vagrant_provider: str = "libvirt"
-    vagrant_instances_root: Path = Path("runtime/vagrant")
-    multipass_default_image: str = "24.04"
     max_instance_cpus: int = 8
     max_instance_memory_mb: int = 16384
     max_instance_disk_gb: int = 100
     max_total_instances: int = 20
     operation_poll_seconds: float = 1
+    operation_worker_concurrency: int = 8
     state_reconcile_seconds: float = 15
     autoscaling_interval_seconds: float = 30
     load_balancer_health_interval_seconds: float = 5
     load_balancer_request_timeout_seconds: float = 30
     one_time_secret_minutes: int = 10
     log_level: str = "INFO"
-    vm_provider: str = "multipass"
     node_offline_seconds: int = 45
-    volumes_root: Path = Path(".stratus-volumes")
-    runtime_root: Path = Path("runtime")
+    node_job_lease_seconds: int = 1200
+    node_job_poll_seconds: float = 0.5
+    node_job_timeout_seconds: int = 1200
 
     @model_validator(mode="after")
     def secure_production(self) -> "Settings":
-        if os.name == "nt" and not shutil.which(self.multipass_executable):
-            installed = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / (
-                "Multipass/bin/multipass.exe"
-            )
-            if (
-                self.multipass_executable.lower() in {"multipass", "multipass.exe"}
-                and installed.is_file()
-            ):
-                self.multipass_executable = str(installed)
+        if self.operation_worker_concurrency < 1:
+            raise ValueError("OPERATION_WORKER_CONCURRENCY must be at least 1")
         if self.app_env == "production":
             if self.development_default_admin:
                 raise ValueError("DEVELOPMENT_DEFAULT_ADMIN must be false in production")

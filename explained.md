@@ -1081,3 +1081,5 @@ Before the presentation, be able to explain and demonstrate:
 - [ ] Authentication versus authorization; hashing versus encryption.
 - [ ] MongoDB's role and application-level relationships.
 - [ ] Current limitations and the next production improvements.
+> Historical note: this document describes the original single-host Multipass prototype. The
+> current distributed Vagrant/libvirt architecture and operating instructions are in `README.md`.

@@ -513,4 +513,6 @@ Always inspect **Operations** after destructive actions and wait for success bef
 | Autoscaling does not react | Group must be enabled; wait for three samples and cooldown; confirm managed VMs are running |
 | Another action returns a conflict | Wait for the instance's current pending/running operation to finish |
 | MongoDB timeout | Allow the host public IP in Atlas and verify the connection URI |
+> Historical note: these manual scenarios target the original single-host prototype. Use the
+> automated checks and distributed-node workflow documented in `README.md` for the current system.
 

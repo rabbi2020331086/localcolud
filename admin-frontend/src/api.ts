@@ -7,7 +7,7 @@ export const apiBaseUrl = String(
 export const api = axios.create({
   baseURL: apiBaseUrl,
   withCredentials: true,
-  headers: { "Content-Type": "application/json" },
+  headers: { "Content-Type": "application/json", "X-LocalEC2-Client": "admin" },
 });
 
 type RetriableRequest = InternalAxiosRequestConfig & { _localEc2Retried?: boolean };
@@ -18,7 +18,7 @@ function refreshAccessToken() {
     refreshRequest = axios.post<{ access_token: string }>(
       `${apiBaseUrl}/auth/refresh`,
       undefined,
-      { withCredentials: true },
+      { withCredentials: true, headers: { "X-LocalEC2-Client": "admin" } },
     ).then(response => response.data.access_token).finally(() => { refreshRequest = null; });
   }
   return refreshRequest;

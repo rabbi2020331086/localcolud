@@ -19,10 +19,6 @@ done
 [[ -f "$ROOT/backend/.env" ]] || { echo "backend/.env is missing." >&2; exit 1; }
 command -v pnpm >/dev/null || { echo "pnpm is missing; run ./setup-ubuntu.sh." >&2; exit 1; }
 
-if ! command -v multipass >/dev/null || ! multipass version >/dev/null 2>&1; then
-  echo "Warning: Multipass is unavailable; VM actions will not work." >&2
-fi
-
 cd "$ROOT/backend"
 "$PYTHON" -m app.check_database
 # Reload backend code during local development just as Vite reloads the frontend.

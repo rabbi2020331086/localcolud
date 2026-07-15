@@ -53,7 +53,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y \
   ca-certificates curl python3 python3-venv python3-pip \
-  qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils \
+  qemu-kvm ovmf libvirt-daemon-system libvirt-clients bridge-utils \
   vagrant build-essential ruby-dev libvirt-dev pkg-config
 
 echo "[2/7] Creating the restricted LocalEC2 service account"
@@ -72,21 +72,38 @@ install -d -o root -g localec2 -m 0750 /etc/localec2
 
 echo "[3/7] Enabling the system libvirt daemon and default NAT network"
 systemctl enable --now libvirtd
-if ! virsh net-info default >/dev/null 2>&1; then
+VIRSH=(virsh --connect qemu:///system)
+if ! "${VIRSH[@]}" net-info default >/dev/null 2>&1; then
   if [[ -f /usr/share/libvirt/networks/default.xml ]]; then
-    virsh net-define /usr/share/libvirt/networks/default.xml
+    "${VIRSH[@]}" net-define /usr/share/libvirt/networks/default.xml
   else
     echo "Warning: libvirt did not provide a default network definition." >&2
   fi
 fi
-if virsh net-info default >/dev/null 2>&1; then
-  virsh net-autostart default >/dev/null
-  if ! virsh net-info default | grep -qE '^Active:[[:space:]]+yes$'; then
-    virsh net-start default >/dev/null
+if "${VIRSH[@]}" net-info default >/dev/null 2>&1; then
+  "${VIRSH[@]}" net-autostart default >/dev/null
+  if ! "${VIRSH[@]}" net-list --name | grep -Fxq 'default'; then
+    # libvirt may activate the network between the check and start command.
+    # Treat that race as success after confirming the network is now active.
+    if ! network_start_error=$("${VIRSH[@]}" net-start default 2>&1); then
+      if ! "${VIRSH[@]}" net-list --name | grep -Fxq 'default'; then
+        echo "$network_start_error" >&2
+        exit 1
+      fi
+    fi
   fi
 fi
 
 echo "[4/7] Installing the Vagrant libvirt provider"
+# Ubuntu ships a legacy, root-owned system plugin state file. Vagrant upgrades
+# it on first use. Perform that migration before the sandboxed agent starts;
+# inside ProtectSystem=strict the same write correctly fails with EROFS.
+if [[ -f /usr/share/vagrant-plugins/plugins.json ]]; then
+  if ! env HOME=/root VAGRANT_HOME=/root/.vagrant.d \
+    vagrant plugin list >/dev/null; then
+    echo "Warning: Vagrant's system plugin state could not be initialized." >&2
+  fi
+fi
 if ! runuser -u localec2 -- env \
   HOME=/var/lib/localec2 \
   VAGRANT_HOME=/var/lib/localec2/.vagrant.d \
@@ -136,6 +153,6 @@ fi
 echo
 echo "LocalEC2 node installation is complete."
 echo "The agent uses outbound HTTP(S); no inbound management port was opened."
-echo "Libvirt network: $(virsh net-list --all --name | paste -sd, -)"
+echo "Libvirt network: $("${VIRSH[@]}" net-list --all --name | paste -sd, -)"
 echo "Agent status: systemctl status localec2-agent"
 echo "Agent logs:   journalctl -u localec2-agent -f"

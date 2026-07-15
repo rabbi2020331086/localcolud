@@ -1,8 +1,6 @@
-import asyncio
+import base64
 import io
-import shutil
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -11,11 +9,9 @@ from fastapi.responses import StreamingResponse
 from pymongo.errors import DuplicateKeyError
 
 from app.api.dependencies import CurrentUser
-from app.core.config import settings
 from app.core.security import fernet
 from app.infrastructure.database import Database, from_document, from_documents, to_document
-from app.infrastructure.models import Instance, KeyPair, SecurityGroup, Volume
-from app.infrastructure.vm import ProviderUnavailable, provider
+from app.infrastructure.models import Instance, InstanceStatus, KeyPair, SecurityGroup, Volume
 from app.schemas import (
     KeyPairIn,
     KeyPairOut,
@@ -25,37 +21,22 @@ from app.schemas import (
     VolumeIn,
     VolumeOut,
 )
-from app.services.operations import key_pair
+from app.services import node_jobs
+from app.services.operations import key_pair, security_script
 
 key_pairs = APIRouter(prefix="/key-pairs", tags=["Key pairs"])
 security_groups = APIRouter(prefix="/security-groups", tags=["Security groups"])
 volumes = APIRouter(prefix="/volumes", tags=["Volumes"])
-volume_mount_lock = asyncio.Lock()
 
 
-def directory_size(path: Path) -> int:
-    total = 0
-    if not path.exists():
-        return total
-    for item in path.rglob("*"):
-        try:
-            if item.is_file():
-                total += item.stat().st_size
-        except OSError:
-            continue
-    return total
-
-
-async def volume_output(row: Volume) -> VolumeOut:
-    used = await asyncio.to_thread(directory_size, Path(row.host_path))
+def volume_output(row: Volume) -> VolumeOut:
     capacity = row.size_gb * 1024**3
-    available = max(0, capacity - used)
     return VolumeOut.model_validate(
         {
             **row.model_dump(),
-            "used_bytes": used,
-            "available_bytes": available,
-            "usage_percent": round(min(100, used * 100 / capacity), 2),
+            "used_bytes": 0,
+            "available_bytes": capacity,
+            "usage_percent": 0,
         }
     )
 
@@ -150,6 +131,35 @@ async def sg_update(
     row: SecurityGroup = await owned(database, "security_groups", SecurityGroup, user.id, item_id)
     update = {**data.model_dump(mode="json"), "updated_at": datetime.now(UTC)}
     await database.security_groups.update_one({"_id": str(row.id)}, {"$set": update})
+    affected = from_documents(
+        Instance,
+        await database.instances.find(
+            {
+                "security_group_ids": str(row.id),
+                "deleted_at": None,
+                "status": InstanceStatus.RUNNING,
+                "node_id": {"$ne": None},
+            }
+        ).to_list(None),
+    )
+    failures = 0
+    for instance in affected:
+        script = await security_script(instance)
+        encoded = base64.b64encode(script.encode()).decode()
+        try:
+            await node_jobs.remote_exec(
+                instance,
+                f"printf '%s' '{encoded}' | base64 -d | sudo bash",
+                timeout=120,
+            )
+        except Exception:
+            failures += 1
+    if failures:
+        raise HTTPException(
+            502,
+            f"Policy was saved, but {failures} running instance(s) could not apply it; "
+            "restart those instances after their nodes reconnect.",
+        )
     return SecurityGroup.model_validate({**row.model_dump(), **update})
 
 
@@ -167,84 +177,30 @@ async def volume_list(user: CurrentUser, database: Database) -> list[VolumeOut]:
         Volume,
         await database.volumes.find({"user_id": str(user.id)}).sort("name", 1).to_list(None),
     )
-    return await asyncio.gather(*(volume_output(row) for row in rows))
+    return [volume_output(row) for row in rows]
 
 
 @volumes.post("", response_model=VolumeOut, status_code=201)
 async def volume_create(data: VolumeIn, user: CurrentUser, database: Database) -> VolumeOut:
-    root = settings.volumes_root.expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    row = Volume(user_id=user.id, name=data.name, size_gb=data.size_gb, host_path="")
-    path = root / str(row.id)
-    path.mkdir(mode=0o700)
-    row.host_path = str(path)
-    try:
-        await database.volumes.insert_one(to_document(row))
-    except DuplicateKeyError:
-        shutil.rmtree(path)
-        raise HTTPException(409, "A volume with this name already exists") from None
-    return await volume_output(row)
+    raise HTTPException(
+        501,
+        "Distributed volumes require Ceph RBD or another node-accessible block-storage backend; "
+        "control-plane host directories have been disabled.",
+    )
 
 
 @volumes.post("/{item_id}/attach", response_model=VolumeOut)
 async def volume_attach(
     item_id: UUID, data: VolumeAttachIn, user: CurrentUser, database: Database
 ) -> VolumeOut:
-    row: Volume = await owned(database, "volumes", Volume, user.id, item_id)
-    if row.attached_instance_id:
-        raise HTTPException(409, "Volume is already attached")
-    instance = from_document(
-        Instance,
-        await database.instances.find_one(
-            {"_id": str(data.instance_id), "user_id": str(user.id), "deleted_at": None}
-        ),
-    )
-    if not instance:
-        raise HTTPException(404, "Instance not found")
-    async with volume_mount_lock:
-        current = await owned(database, "volumes", Volume, user.id, item_id)
-        if current.attached_instance_id:
-            raise HTTPException(409, "Volume is already attached")
-        try:
-            await provider.mount(row.host_path, instance.multipass_name, data.mount_path)
-        except ProviderUnavailable as exc:
-            raise HTTPException(409, str(exc)) from None
-        update = {
-            "attached_instance_id": str(instance.id),
-            "mount_path": data.mount_path,
-            "updated_at": datetime.now(UTC),
-        }
-        try:
-            await database.volumes.update_one({"_id": str(row.id)}, {"$set": update})
-        except Exception:
-            await provider.unmount(instance.multipass_name, data.mount_path)
-            raise
-    return await volume_output(Volume.model_validate({**row.model_dump(), **update}))
+    raise HTTPException(501, "Distributed volume attachment is not configured")
 
 
 @volumes.post("/{item_id}/detach", response_model=VolumeOut)
 async def volume_detach(item_id: UUID, user: CurrentUser, database: Database) -> VolumeOut:
-    row: Volume = await owned(database, "volumes", Volume, user.id, item_id)
-    if not row.attached_instance_id or not row.mount_path:
-        raise HTTPException(409, "Volume is not attached")
-    instance = from_document(
-        Instance,
-        await database.instances.find_one({"_id": str(row.attached_instance_id)}),
-    )
-    if instance:
-        try:
-            await provider.unmount(instance.multipass_name, row.mount_path)
-        except ProviderUnavailable as exc:
-            raise HTTPException(409, str(exc)) from None
-    update = {"attached_instance_id": None, "mount_path": None, "updated_at": datetime.now(UTC)}
-    await database.volumes.update_one({"_id": str(row.id)}, {"$set": update})
-    return await volume_output(Volume.model_validate({**row.model_dump(), **update}))
+    raise HTTPException(501, "Distributed volume detachment is not configured")
 
 
 @volumes.delete("/{item_id}", status_code=204)
 async def volume_delete(item_id: UUID, user: CurrentUser, database: Database) -> None:
-    row: Volume = await owned(database, "volumes", Volume, user.id, item_id)
-    if row.attached_instance_id:
-        raise HTTPException(409, "Detach the volume before deleting it")
-    shutil.rmtree(Path(row.host_path), ignore_errors=True)
-    await database.volumes.delete_one({"_id": str(row.id)})
+    raise HTTPException(501, "Distributed volume deletion is not configured")

@@ -10,7 +10,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useQuery } from "@tanstack/react-query";
 import { api, message } from "../api/client";
@@ -25,13 +25,12 @@ import {
 } from "../components/ui";
 import {
   useInstanceAction,
-  useAmis,
   useInstances,
   useKeyPairs,
   useOperations,
   useSecurityGroups,
 } from "../hooks/data";
-import type { Instance, Operation } from "../types";
+import type { Instance, Operation, ZoneCapacity } from "../types";
 function useKeyDownloads(operations: Operation[]) {
   const handled = useRef(new Set<string>());
   useEffect(() => {
@@ -58,6 +57,15 @@ function useKeyDownloads(operations: Operation[]) {
     }
   }, [operations]);
 }
+async function downloadKey(token: string, filename: string) {
+  const { data } = await api.get(`/key-downloads/${token}`, { responseType: "blob" });
+  const url = URL.createObjectURL(data as Blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
 export function InstancesPage() {
   const { data = [], isLoading, error } = useInstances();
   const { data: operations = [] } = useOperations();
@@ -78,7 +86,7 @@ export function InstancesPage() {
     <>
       <PageHeader
         title="Instances"
-        description="Ubuntu virtual machines running through Multipass on this PC."
+        description="Virtual machines placed into administrator-managed availability zones."
         action={
           <Link className="button" to="/instances/new">
             <Plus />
@@ -93,7 +101,7 @@ export function InstancesPage() {
         ) : data.length === 0 ? (
           <Empty
             title="No instances yet"
-            detail="Launch your first local Ubuntu virtual machine."
+            detail="Launch after an administrator makes cloud capacity available."
           />
         ) : (
           <div className="table-wrap">
@@ -143,7 +151,7 @@ export function InstancesPage() {
                         </Link>
                         <Link
                           aria-disabled={item.status !== "RUNNING"}
-                          title="Terminal"
+                          title="SSH instructions"
                           to={`/instances/${item.id}/connect`}
                         >
                           <SquareTerminal />
@@ -209,7 +217,6 @@ type Launch = {
   name: string;
   description: string;
   image: string;
-  ami_id: string;
   cpu_count: number;
   memory_mb: number;
   disk_gb: number;
@@ -217,19 +224,18 @@ type Launch = {
   instance_type: string;
   key_pair_id: string;
   security_group_ids: string[];
+  availability_zone: string;
 };
 export function LaunchPage() {
   const nav = useNavigate();
   const {
     register,
     watch,
-    setValue,
     handleSubmit,
     formState: { errors, isSubmitting },
   } = useForm<Launch>({
     defaultValues: {
       image: "24.04",
-      ami_id: "",
       cpu_count: 2,
       memory_mb: 2048,
       disk_gb: 10,
@@ -237,14 +243,14 @@ export function LaunchPage() {
       instance_type: "t2.small",
       key_pair_id: "",
       security_group_ids: [],
+      availability_zone: "",
     },
   });
-  const [cpu, memory, disk, instanceType, amiId] = watch([
+  const [cpu, memory, disk, instanceType] = watch([
     "cpu_count",
     "memory_mb",
     "disk_gb",
     "instance_type",
-    "ami_id",
   ]);
   const preset = {
     "t2.micro": [1, 1024],
@@ -259,19 +265,23 @@ export function LaunchPage() {
   const allocatedCpu = preset?.[0] ?? cpu;
   const allocatedMemory = preset?.[1] ?? memory;
   const keyPairs = useKeyPairs();
-  const amis = useAmis();
-  const selectedAmi = amis.data?.find((ami) => ami.id === amiId);
-  useEffect(() => {
-    if (!selectedAmi) return;
-    setValue("image", selectedAmi.image);
-    setValue("disk_gb", selectedAmi.disk_gb);
-  }, [selectedAmi, setValue]);
   const securityGroups = useSecurityGroups();
+  const zones = useQuery({
+    queryKey: ["capacity-zones"],
+    queryFn: () => api.get<ZoneCapacity[]>("/instances/capacity/zones").then(response => response.data),
+    refetchInterval: 10000,
+  });
+  const requestedZone = watch("availability_zone");
+  const eligibleZones = (zones.data ?? []).filter((zone) => zone.available);
+  const requestedCapacityAvailable = requestedZone
+    ? eligibleZones.some((zone) => zone.availability_zone === requestedZone)
+    : eligibleZones.length > 0;
   const submit = handleSubmit(async (values) => {
     const { data } = await api.post<{ instance_id: string }>("/instances", {
       ...values,
-      ami_id: values.ami_id || null,
       key_pair_id: values.key_pair_id || null,
+      create_key_pair: values.key_pair_id ? false : values.create_key_pair,
+      availability_zone: values.availability_zone || null,
     });
     nav(`/instances/${data.instance_id}`);
   });
@@ -279,7 +289,7 @@ export function LaunchPage() {
     <>
       <PageHeader
         title="Launch instance"
-        description="Create a real Ubuntu VM on this Ubuntu PC."
+        description="Choose a failure domain; the scheduler reserves an approved node before launch."
       />
       <div className="form-grid">
         <Card>
@@ -303,15 +313,21 @@ export function LaunchPage() {
             </label>
             <div className="fields">
               <label>
-                Machine image
-                <select {...register("ami_id")}>
-                  <option value="">Standard Ubuntu image</option>
-                  {amis.data?.map((ami) => (
-                    <option key={ami.id} value={ami.id}>
-                      {ami.name} · Ubuntu {ami.image} · {ami.disk_gb} GB
-                    </option>
-                  ))}
+                Availability zone
+                <select {...register("availability_zone")}>
+                  <option value="">Automatic placement</option>
+                  {zones.data?.map(zone => <option disabled={!zone.available} value={zone.availability_zone} key={zone.availability_zone}>{zone.availability_zone}{zone.available ? "" : " · unavailable"}</option>)}
                 </select>
+                {!requestedCapacityAvailable && <small>No approved capacity is currently available in this placement.</small>}
+              </label>
+              <label>
+                Machine image
+                <select {...register("image")}>
+                  <option value="24.04">Ubuntu 24.04 LTS</option>
+                  <option value="22.04">Ubuntu 22.04 LTS</option>
+                  <option value="debian-12">Debian 12</option>
+                </select>
+                <small>Custom distributed images require replicated image storage and are not enabled yet.</small>
               </label>
               <label>
                 Instance type
@@ -335,24 +351,6 @@ export function LaunchPage() {
                   <option value="custom">Custom</option>
                 </select>
               </label>
-              {selectedAmi ? (
-                <label>
-                  Image contents
-                  <input
-                    value={`AMI ${selectedAmi.name} · Ubuntu ${selectedAmi.image}`}
-                    readOnly
-                  />
-                  <small>Operating system and installed software come from the AMI.</small>
-                </label>
-              ) : (
-                <label>
-                  Ubuntu image
-                  <select {...register("image")}>
-                    <option>24.04</option>
-                    <option>22.04</option>
-                  </select>
-                </label>
-              )}
               <label>
                 vCPUs
                 <input
@@ -376,15 +374,10 @@ export function LaunchPage() {
                 Disk (GB)
                 <input
                   type="number"
-                  min={selectedAmi?.disk_gb ?? 5}
+                  min="5"
                   max="100"
                   {...register("disk_gb", { valueAsNumber: true })}
                 />
-                {selectedAmi && (
-                  <small>
-                    Defaults to the AMI size; you may increase it, but not shrink it.
-                  </small>
-                )}
               </label>
             </div>
             <div className="fields">
@@ -439,14 +432,14 @@ export function LaunchPage() {
             </label>
             <div className="form-actions">
               <Link to="/instances">Cancel</Link>
-              <Button disabled={isSubmitting}>
+              <Button disabled={isSubmitting || !requestedCapacityAvailable}>
                 {isSubmitting ? "Queuing…" : "Launch instance"}
               </Button>
             </div>
           </form>
         </Card>
         <Card className="estimate">
-          <h3>Local allocation</h3>
+          <h3>Requested allocation</h3>
           <div>
             <strong>{allocatedCpu}</strong>
             <span>vCPUs</span>
@@ -460,8 +453,8 @@ export function LaunchPage() {
             <span>disk</span>
           </div>
           <p>
-            Multipass allocates these resources from your host. The first image
-            download can take several minutes.
+            The control plane reserves these resources inside the selected
+            availability zone. Launch is rejected when placement cannot be satisfied.
           </p>
         </Card>
       </div>
@@ -477,6 +470,8 @@ export function InstanceDetailsPage() {
     refetchInterval: 3000,
   });
   const { data: operations = [] } = useOperations();
+  const [keyBusy, setKeyBusy] = useState(false);
+  const [keyError, setKeyError] = useState("");
   useKeyDownloads(
     operations.filter((operation) => operation.instance_id === instanceId),
   );
@@ -517,6 +512,7 @@ export function InstanceDetailsPage() {
         </Card>
       )}
       <div className="details-grid">
+        {keyError && <ErrorAlert>{keyError}</ErrorAlert>}
         <Card>
           <h2>Overview</h2>
           <dl>
@@ -530,17 +526,19 @@ export function InstanceDetailsPage() {
             </dd>
             <dt>SSH command</dt>
             <dd>
-              <code>ssh ubuntu@{item.ipv4_address ?? "&lt;pending&gt;"}</code>
+              <code>ssh {item.ssh_username}@{item.ipv4_address ?? "<pending>"}</code>
             </dd>
             <dt>Created</dt>
             <dd>{new Date(item.created_at).toLocaleString()}</dd>
+            <dt>Availability zone</dt>
+            <dd>{item.availability_zone}</dd>
           </dl>
         </Card>
         <Card>
           <h2>Configuration</h2>
           <dl>
             <dt>Image</dt>
-            <dd>Ubuntu {item.image}</dd>
+            <dd>{item.image === "debian-12" ? "Debian 12" : `Ubuntu ${item.image}`}</dd>
             <dt>Compute</dt>
             <dd>
               {item.cpu_count} vCPU · {item.memory_mb / 1024} GB RAM
@@ -549,6 +547,35 @@ export function InstanceDetailsPage() {
             <dd>{item.disk_gb} GB</dd>
             <dt>Key fingerprint</dt>
             <dd className="break">{item.key_fingerprint ?? "No key pair"}</dd>
+            {item.status === "RUNNING" && (
+              <>
+                <dt>Private key</dt>
+                <dd>
+                  <Button
+                    className="secondary"
+                    disabled={keyBusy}
+                    onClick={async () => {
+                      setKeyBusy(true);
+                      setKeyError("");
+                      try {
+                        const { data } = await api.post<{
+                          key_download_token: string;
+                          key_filename: string;
+                        }>(`/instances/${item.id}/ssh-key`);
+                        await downloadKey(data.key_download_token, data.key_filename);
+                      } catch (error) {
+                        setKeyError(message(error));
+                      } finally {
+                        setKeyBusy(false);
+                      }
+                    }}
+                  >
+                    <KeyRound />
+                    {keyBusy ? "Installing…" : "Generate replacement key"}
+                  </Button>
+                </dd>
+              </>
+            )}
           </dl>
         </Card>
       </div>
@@ -561,7 +588,7 @@ export function InstanceDetailsPage() {
             <div className="operation-row" key={op.id}>
               <Status value={op.status} />
               <strong>{op.operation_type}</strong>
-              <span>{op.message}</span>
+              <span>{op.error_message ?? op.message}</span>
               <span>{op.progress}%</span>
             </div>
           ))}

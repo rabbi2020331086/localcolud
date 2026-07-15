@@ -28,10 +28,13 @@ export type CloudNode = {
   hostname: string | null;
   management_address: string | null;
   cpu_total: number;
+  cpu_reserved: number;
   cpu_allocated: number;
   memory_total_mb: number;
+  memory_reserved_mb: number;
   memory_allocated_mb: number;
   storage_total_gb: number;
+  storage_reserved_gb: number;
   storage_allocated_gb: number;
   capabilities: string[];
   network_interfaces: { name: string; family: string; address: string }[];

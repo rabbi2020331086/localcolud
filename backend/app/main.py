@@ -1,10 +1,9 @@
 import asyncio
-import json
 import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,11 +14,10 @@ from app.core.config import settings
 from app.core.security import decode_jwt
 from app.infrastructure.database import close_database, database, from_document, initialize_database
 from app.infrastructure.metrics import CPU_PERCENT_COMMAND
-from app.infrastructure.models import Instance, InstanceStatus, LoadBalancer
-from app.infrastructure.terminal import create_terminal
-from app.infrastructure.vm import provider
+from app.infrastructure.models import Instance, InstanceStatus
 from app.services import autoscaling as autoscaling_service
 from app.services import load_balancing as load_balancing_service
+from app.services import node_jobs
 from app.services import operations as operation_service
 from app.services import reconciliation as reconciliation_service
 
@@ -28,10 +26,15 @@ log = logging.getLogger("localec2")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    try:
-        await initialize_database()
-    except Exception as exc:
-        log.warning("MongoDB initialization failed: %s", exc)
+    for attempt in range(1, 4):
+        try:
+            await initialize_database()
+            break
+        except Exception:
+            if attempt == 3:
+                raise
+            log.warning("MongoDB initialization failed; retrying (%s/3)", attempt)
+            await asyncio.sleep(2)
     operation_service.worker_task = asyncio.create_task(operation_service.operation_loop())
     autoscaling_service.worker_task = asyncio.create_task(autoscaling_service.autoscaling_loop())
     load_balancing_service.worker_task = asyncio.create_task(load_balancing_service.health_loop())
@@ -39,26 +42,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         reconciliation_service.reconciliation_loop()
     )
     yield
-    operation_service.worker_task.cancel()
-    autoscaling_service.worker_task.cancel()
-    load_balancing_service.worker_task.cancel()
-    reconciliation_service.worker_task.cancel()
-    try:
-        await operation_service.worker_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await reconciliation_service.worker_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await autoscaling_service.worker_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await load_balancing_service.worker_task
-    except asyncio.CancelledError:
-        pass
+    tasks = [
+        operation_service.worker_task,
+        autoscaling_service.worker_task,
+        load_balancing_service.worker_task,
+        reconciliation_service.worker_task,
+    ]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
     await close_database()
 
 
@@ -110,15 +102,20 @@ async def readiness() -> dict[str, object]:
         await database.command("ping")
     except Exception:
         database_ready = False
-    try:
-        vm = await provider.health_check()
-    except Exception as exc:
-        log.warning("Multipass health check failed: %s", exc)
-        vm = False
+    deadline = datetime.now(UTC) - timedelta(seconds=settings.node_offline_seconds)
+    online_nodes = await database.cloud_nodes.count_documents(
+        {
+            "approved": True,
+            "schedulable": True,
+            "last_seen_at": {"$gte": deadline},
+            "provider_name": "vagrant-libvirt",
+            "capabilities": {"$all": ["jobs", "vagrant", "libvirt", "kvm"]},
+        }
+    )
     return {
-        "status": "ready" if database_ready and vm else "degraded",
+        "status": "ready" if database_ready and online_nodes else "degraded",
         "database": database_ready,
-        "multipass": vm,
+        "compute_capacity_ready": bool(online_nodes),
         "worker": bool(operation_service.worker_task and not operation_service.worker_task.done()),
     }
 
@@ -137,62 +134,6 @@ def ws_identity(websocket: WebSocket) -> tuple[uuid.UUID, str | None] | None:
             except Exception:
                 return None
     return None
-
-
-@app.websocket("/ws/load-balancers/{load_balancer_id}/terminal")
-async def load_balancer_terminal(websocket: WebSocket) -> None:
-    identity = ws_identity(websocket)
-    if not identity:
-        await websocket.close(4401)
-        return
-    user_id, protocol = identity
-    try:
-        load_balancer_id = uuid.UUID(websocket.path_params["load_balancer_id"])
-    except ValueError:
-        await websocket.close(4404)
-        return
-    load_balancer = from_document(
-        LoadBalancer,
-        await database.load_balancers.find_one(
-            {"_id": str(load_balancer_id), "user_id": str(user_id), "enabled": True}
-        ),
-    )
-    if not load_balancer:
-        await websocket.close(4404)
-        return
-    await websocket.accept(subprotocol=protocol)
-    await websocket.send_json({"type": "ready", "message": "Load-aware command terminal ready"})
-    try:
-        while True:
-            payload = json.loads(await websocket.receive_text())
-            command = str(payload.get("command", "")).strip()
-            if not command:
-                continue
-            if len(command) > 4000:
-                await websocket.send_json({"type": "error", "message": "Command is too long"})
-                continue
-            selected = await load_balancing_service.select_lowest_load(load_balancer)
-            if not selected:
-                await websocket.send_json(
-                    {"type": "error", "message": "No running target can execute commands"}
-                )
-                continue
-            target, cpu = selected
-            await websocket.send_json(
-                {"type": "selected", "target": target.display_name, "cpu_percent": cpu}
-            )
-            try:
-                output = await provider.exec(
-                    target.multipass_name, ["sh", "-lc", command], timeout=300
-                )
-                await websocket.send_json({"type": "output", "data": output})
-                await websocket.send_json({"type": "done", "target": target.display_name})
-            except Exception as exc:
-                await websocket.send_json({"type": "error", "message": str(exc)})
-            finally:
-                await load_balancing_service.release_target(load_balancer.id, target.id)
-    except (WebSocketDisconnect, json.JSONDecodeError):
-        return
 
 
 async def ws_instance(websocket: WebSocket) -> Instance | None:
@@ -224,16 +165,12 @@ async def metrics_ws(websocket: WebSocket) -> None:
             if item.status != InstanceStatus.RUNNING:
                 await websocket.send_json({"type": "stopped"})
                 break
-            output = await provider.exec(
-                item.multipass_name,
-                [
-                    "sh",
-                    "-lc",
-                    CPU_PERCENT_COMMAND + "; echo; "
-                    "free -m | awk 'NR==2{printf \"%.1f\",$3*100/$2}'; echo; "
-                    "df -P / | awk 'NR==2{gsub(/%/,\"\",$5);print $5}'; "
-                    "awk 'NR>2{rx+=$2;tx+=$10} END{print rx;print tx}' /proc/net/dev",
-                ],
+            output = await node_jobs.remote_exec(
+                item,
+                CPU_PERCENT_COMMAND
+                + "; echo; free -m | awk 'NR==2{printf \"%.1f\",$3*100/$2}'; echo; "
+                "df -P / | awk 'NR==2{gsub(/%/,\"\",$5);print $5}'; "
+                "awk 'NR>2{rx+=$2;tx+=$10} END{print rx;print tx}' /proc/net/dev",
             )
             v = output.splitlines()
             await websocket.send_json(
@@ -261,29 +198,8 @@ async def terminal_ws(websocket: WebSocket) -> None:
         await websocket.close(4409)
         return
     await websocket.accept(subprotocol=getattr(websocket.state, "auth_protocol", None))
-    process = await create_terminal(settings.multipass_executable, item.multipass_name)
-
-    async def output() -> None:
-        while True:
-            data = await process.read(4096)
-            if not data:
-                break
-            await websocket.send_text(data)
-
-    task = asyncio.create_task(output())
-    try:
-        while True:
-            message = await websocket.receive()
-            if "bytes" in message and message["bytes"]:
-                await process.write(message["bytes"].decode(errors="replace"))
-            elif "text" in message and message["text"]:
-                data = json.loads(message["text"])
-                if data.get("type") == "input":
-                    await process.write(str(data.get("data", "")))
-                elif data.get("type") == "resize":
-                    await process.resize(int(data.get("rows", 30)), int(data.get("cols", 120)))
-    except WebSocketDisconnect:
-        pass
-    finally:
-        await process.close()
-        task.cancel()
+    await websocket.send_text(
+        "Interactive PTY is disabled for distributed nodes. Use the instance SSH address and "
+        "downloaded key; reverse agent terminal streaming is not configured yet.\r\n"
+    )
+    await websocket.close(4410)

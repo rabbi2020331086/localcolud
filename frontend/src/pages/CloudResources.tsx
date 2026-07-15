@@ -23,32 +23,19 @@ export function AmisPage() {
   const { data: instances = [] } = useInstances();
   const qc = useQueryClient();
   const [error, setError] = useState("");
-  const create = useMutation({
-    mutationFn: (form: FormData) =>
-      api.post("/amis", {
-        name: form.get("name"),
-        description: form.get("description"),
-        source_instance_id: form.get("source_instance_id"),
-      }),
-    onSuccess: () => {
-      setError("");
-      void qc.invalidateQueries({ queryKey: ["amis"] });
-    },
-    onError: (value) => setError(message(value)),
-  });
   const stopped = instances.filter((item) => item.status === "STOPPED");
   return (
     <>
       <PageHeader
         title="AMIs"
-        description="Capture stopped instances and reuse their operating system, software, and data."
+        description="Distributed machine images require replicated image storage across compute nodes."
       />
+      <ErrorAlert>AMI capture and deletion are intentionally disabled until cross-node image replication is configured. Standard Ubuntu boxes remain available when launching instances.</ErrorAlert>
       {error && <ErrorAlert>{error}</ErrorAlert>}
       <Card>
         <form
           onSubmit={(event) => {
             event.preventDefault();
-            create.mutate(new FormData(event.currentTarget));
           }}
         >
           <div className="fields">
@@ -71,9 +58,9 @@ export function AmisPage() {
             </label>
           </div>
           <div className="form-actions">
-            <Button disabled={create.isPending || stopped.length === 0}>
+            <Button disabled>
               <Plus />
-              {create.isPending ? "Creating image…" : "Create AMI"}
+              Create AMI
             </Button>
           </div>
           {stopped.length === 0 && <small>Stop an instance before creating an AMI.</small>}
@@ -96,7 +83,7 @@ export function AmisPage() {
                     <td>Ubuntu {ami.image}</td>
                     <td>{ami.cpu_count} vCPU · {ami.memory_mb / 1024} GB · {ami.disk_gb} GB</td>
                     <td>{new Date(ami.created_at).toLocaleDateString()}</td>
-                    <td><button className="danger-icon" title="Delete AMI" onClick={async () => {
+                    <td><button className="danger-icon" disabled title="Distributed AMI deletion is not enabled" onClick={async () => {
                       if (!confirm(`Delete AMI ${ami.name}?`)) return;
                       try {
                         await api.delete(`/amis/${ami.id}`);
@@ -460,45 +447,19 @@ export function VolumesPage() {
   const instances = useInstances();
   const qc = useQueryClient();
   const [error, setError] = useState("");
-  const [attachingId, setAttachingId] = useState<string | null>(null);
   const refresh = () => void qc.invalidateQueries({ queryKey: ["volumes"] });
-  const create = useMutation({
-    mutationFn: (form: FormData) =>
-      api.post("/volumes", {
-        name: form.get("name"),
-        size_gb: Number(form.get("size")),
-      }),
-    onSuccess: refresh,
-    onError: (value) => setError(message(value)),
-  });
-  const attach = async (volumeId: string, form: FormData) => {
-    if (attachingId) return;
-    setAttachingId(volumeId);
-    try {
-      await api.post(`/volumes/${volumeId}/attach`, {
-        instance_id: form.get("instance"),
-        mount_path: form.get("path"),
-      });
-      setError("");
-      await qc.invalidateQueries({ queryKey: ["volumes"] });
-    } catch (value) {
-      setError(message(value));
-    } finally {
-      setAttachingId(null);
-    }
-  };
   return (
     <>
       <PageHeader
         title="Volumes"
-        description="Instance-independent host storage that can move between VMs without losing data."
+        description="Network block storage will be enabled after replicated storage is configured across nodes."
       />
+      <ErrorAlert>Volume create, attach, detach, and delete are disabled because host-directory storage cannot provide EBS-style durability or cross-node failover.</ErrorAlert>
       {error && <ErrorAlert>{error}</ErrorAlert>}
       <Card>
         <form
           onSubmit={(event) => {
             event.preventDefault();
-            create.mutate(new FormData(event.currentTarget));
           }}
         >
           <div className="fields">
@@ -518,7 +479,7 @@ export function VolumesPage() {
             </label>
           </div>
           <div className="form-actions">
-            <Button>
+            <Button disabled>
               <Plus />
               Create volume
             </Button>
@@ -545,7 +506,7 @@ export function VolumesPage() {
                 </div>
                 <button
                   className="danger-icon"
-                  disabled={!!volume.attached_instance_id}
+                  disabled
                   onClick={async () => {
                     if (
                       confirm("Permanently delete this volume and its data?")
@@ -575,6 +536,7 @@ export function VolumesPage() {
               {volume.attached_instance_id ? (
                 <Button
                   className="secondary"
+                  disabled
                   onClick={async () => {
                     try {
                       await api.post(`/volumes/${volume.id}/detach`);
@@ -591,7 +553,6 @@ export function VolumesPage() {
                 <form
                   onSubmit={(event) => {
                     event.preventDefault();
-                    void attach(volume.id, new FormData(event.currentTarget));
                   }}
                 >
                   <label>
@@ -612,15 +573,10 @@ export function VolumesPage() {
                   </label>
                   <div className="form-actions">
                     <Button
-                      disabled={
-                        attachingId === volume.id ||
-                        !instances.data?.some(
-                          (item) => item.status === "RUNNING",
-                        )
-                      }
+                      disabled
                     >
                       <Link />
-                      {attachingId === volume.id ? "Attaching…" : "Attach"}
+                      Attach
                     </Button>
                   </div>
                 </form>

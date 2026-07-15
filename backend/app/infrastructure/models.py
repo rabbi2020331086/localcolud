@@ -53,6 +53,13 @@ class NodeStatus(enum.StrEnum):
     DRAINING = "DRAINING"
 
 
+class NodeJobStatus(enum.StrEnum):
+    QUEUED = "QUEUED"
+    LEASED = "LEASED"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
 class ComputeProvider(enum.StrEnum):
     MULTIPASS = "multipass"
     VAGRANT_LIBVIRT = "vagrant-libvirt"
@@ -103,14 +110,16 @@ class Instance(StoredModel):
     instance_type: str = "custom"
     image: str
     ami_id: UUID | None = None
-    ssh_username: str = "ubuntu"
+    ssh_username: str = "vagrant"
     key_fingerprint: str | None = None
     has_key_pair: bool = False
     key_pair_id: UUID | None = None
     security_group_ids: list[UUID] = Field(default_factory=list)
     autoscaling_group_id: UUID | None = None
     node_id: UUID | None = None
-    provider_name: ComputeProvider = ComputeProvider.MULTIPASS
+    availability_zone: str = "legacy-unassigned"
+    provider_name: ComputeProvider = ComputeProvider.VAGRANT_LIBVIRT
+    capacity_reserved: bool = False
     last_error: str | None = None
     updated_at: datetime = Field(default_factory=now)
     deleted_at: datetime | None = None
@@ -129,10 +138,13 @@ class CloudNode(StoredModel):
     hostname: str | None = None
     management_address: str | None = None
     cpu_total: int = 0
+    cpu_reserved: int = 1
     cpu_allocated: int = 0
     memory_total_mb: int = 0
+    memory_reserved_mb: int = 1024
     memory_allocated_mb: int = 0
     storage_total_gb: int = 0
+    storage_reserved_gb: int = 10
     storage_allocated_gb: int = 0
     labels: dict[str, str] = Field(default_factory=dict)
     capabilities: list[str] = Field(default_factory=list)
@@ -155,6 +167,22 @@ class Operation(StoredModel):
     error_message: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+
+
+class NodeJob(StoredModel):
+    node_id: UUID
+    instance_id: UUID | None = None
+    operation_id: UUID | None = None
+    job_type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    status: NodeJobStatus = NodeJobStatus.QUEUED
+    attempts: int = 0
+    lease_expires_at: datetime | None = None
+    result_payload: dict[str, Any] = Field(default_factory=dict)
+    error_message: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    updated_at: datetime = Field(default_factory=now)
 
 
 class OneTimeSecret(StoredModel):
@@ -212,6 +240,7 @@ class LoadBalancer(StoredModel):
 
 class ScalingEvent(StoredModel):
     autoscaling_group_id: UUID
+    operation_id: UUID | None = None
     action: str
     previous_size: int
     new_size: int
@@ -267,6 +296,7 @@ class Ami(StoredModel):
     name: str
     description: str = ""
     source_instance_id: UUID
+    node_id: UUID | None = None
     backing_instance_name: str
     status: AmiStatus = AmiStatus.AVAILABLE
     image: str
