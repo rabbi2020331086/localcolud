@@ -84,6 +84,14 @@ async def security_script(instance: Instance) -> str:
                 f"ufw allow out to {rule['source']} port {port} proto {rule['protocol']}"
             )
         commands.extend(["ufw allow out 53/udp", "ufw allow out 53/tcp"])
+        if settings.tailscale_reusable_auth_key:
+            commands.extend(
+                [
+                    "ufw allow out 443/tcp",
+                    "ufw allow out 41641/udp",
+                    "ufw allow out 3478/udp",
+                ]
+            )
     commands.extend(["ufw allow 22/tcp", "ufw --force enable"])
     return "\n".join(commands)
 
@@ -168,8 +176,23 @@ async def run_launch(operation: Operation, instance: Instance) -> dict[str, obje
         "public_key": public or "",
         "user_data": str(operation.request_payload.get("user_data") or ""),
         "security_script": await security_script(instance),
+        "ami_id": str(instance.ami_id) if instance.ami_id else "",
     }
     remote = await node_jobs.dispatch(instance, "LAUNCH", payload, operation.id)
+    tailscale: dict[str, object] = {}
+    public_endpoint_status = "DISABLED"
+    public_endpoint_error: str | None = None
+    if settings.tailscale_reusable_auth_key:
+        try:
+            await update(operation.id, 85, "Publishing the instance through Tailscale Funnel")
+            tailscale = await publish_instance(instance)
+            public_endpoint_status = "ACTIVE"
+        except Exception as exc:
+            # The VM itself is healthy. Keep its capacity reservation and make
+            # the publishing failure visible without misreporting the VM as dead.
+            public_endpoint_status = "ERROR"
+            public_endpoint_error = f"Public endpoint setup failed: {exc}"[:1000]
+            log.warning("Instance %s Tailscale setup failed: %s", instance.id, exc)
     token = result.get("key_download_token")
     if isinstance(token, str):
         await database.one_time_secrets.update_one(
@@ -187,15 +210,73 @@ async def run_launch(operation: Operation, instance: Instance) -> dict[str, obje
             "$set": {
                 "status": InstanceStatus.RUNNING,
                 "ipv4_address": remote.get("ipv4_address"),
+                "tailscale_ipv4_address": tailscale.get("tailscale_ipv4_address"),
+                "tailscale_dns_name": tailscale.get("tailscale_dns_name"),
+                "public_endpoint": tailscale.get("public_endpoint"),
+                "public_endpoint_status": public_endpoint_status,
                 "key_fingerprint": fingerprint,
                 "has_key_pair": public is not None,
-                "last_error": None,
+                "last_error": public_endpoint_error,
                 "updated_at": datetime.now(UTC),
             }
         },
     )
     result["instance_id"] = str(instance.id)
     return result
+
+
+async def publish_instance(instance: Instance) -> dict[str, object]:
+    if not settings.tailscale_reusable_auth_key:
+        raise RuntimeError("TAILSCALE_REUSABLE_AUTH_KEY is not configured")
+    await database.instances.update_one(
+        {"_id": str(instance.id)},
+        {
+            "$set": {
+                "public_endpoint_status": "CONFIGURING",
+                "last_error": None,
+                "updated_at": datetime.now(UTC),
+            }
+        },
+    )
+    hostname = instance.public_hostname or f"instance-{str(instance.id).replace('-', '')[:12]}"
+    try:
+        published = await node_jobs.dispatch_secret(
+            instance,
+            "TAILSCALE_SETUP",
+            {
+                "name": instance.multipass_name,
+                "auth_key": settings.tailscale_reusable_auth_key,
+                "hostname": hostname,
+                "tag": settings.tailscale_instance_tag,
+                "target_port": settings.tailscale_funnel_target_port,
+                "install_default_web": instance.system_role == "customer",
+            },
+            timeout=360,
+        )
+    except Exception as exc:
+        await database.instances.update_one(
+            {"_id": str(instance.id)},
+            {
+                "$set": {
+                    "public_endpoint_status": "ERROR",
+                    "last_error": f"Public endpoint setup failed: {exc}"[:1000],
+                    "updated_at": datetime.now(UTC),
+                }
+            },
+        )
+        raise
+    await database.instances.update_one(
+        {"_id": str(instance.id)},
+        {
+            "$set": {
+                **published,
+                "public_endpoint_status": "ACTIVE",
+                "last_error": None,
+                "updated_at": datetime.now(UTC),
+            }
+        },
+    )
+    return published
 
 
 async def run_operation(operation: Operation) -> None:
@@ -235,6 +316,12 @@ async def run_operation(operation: Operation) -> None:
         result = dict(operation.result_payload)
         if operation.operation_type in (OperationType.LAUNCH, OperationType.SCALE_OUT):
             result = await run_launch(operation, instance)
+        elif operation.operation_type == OperationType.PUBLISH_ENDPOINT:
+            scheduler.require_distributed(instance)
+            if instance.status != InstanceStatus.RUNNING:
+                raise RuntimeError("Instance must be running to publish its endpoint")
+            await update(operation.id, 40, "Installing Tailscale and enabling Funnel")
+            result.update(await publish_instance(instance))
         else:
             scheduler.require_distributed(instance)
             if operation.operation_type == OperationType.START:
@@ -258,6 +345,9 @@ async def run_operation(operation: Operation) -> None:
                         "$set": {
                             "status": InstanceStatus.RUNNING,
                             "ipv4_address": remote.get("ipv4_address"),
+                            "public_endpoint_status": (
+                                "ACTIVE" if instance.public_endpoint else "DISABLED"
+                            ),
                             "updated_at": datetime.now(UTC),
                         }
                     },
@@ -277,6 +367,7 @@ async def run_operation(operation: Operation) -> None:
                         "$set": {
                             "status": InstanceStatus.STOPPED,
                             "ipv4_address": None,
+                            "public_endpoint_status": "DISABLED",
                             "updated_at": datetime.now(UTC),
                         }
                     },
@@ -296,6 +387,7 @@ async def run_operation(operation: Operation) -> None:
                         "$set": {
                             "status": InstanceStatus.HIBERNATED,
                             "ipv4_address": None,
+                            "public_endpoint_status": "DISABLED",
                             "updated_at": datetime.now(UTC),
                         }
                     },
@@ -305,27 +397,61 @@ async def run_operation(operation: Operation) -> None:
                     {"_id": str(instance.id)},
                     {"$set": {"status": InstanceStatus.TERMINATING}},
                 )
+                attached_volumes = await database.volumes.find(
+                    {"attached_instance_id": str(instance.id)}
+                ).to_list(None)
+                for volume in attached_volumes:
+                    try:
+                        await node_jobs.dispatch(
+                            instance,
+                            "VOLUME_DETACH",
+                            {
+                                "name": instance.multipass_name,
+                                "mount_path": volume.get("mount_path") or "/mnt/data",
+                                "device_name": volume.get("device_name") or "vdb",
+                                "volume_id": str(volume["_id"]),
+                            },
+                            timeout=600,
+                        )
+                    except Exception as exc:
+                        # The VM is about to be destroyed, so a missing backing
+                        # image, mount, or guest must not leave a persistent
+                        # volume logically attached to a deleted instance.
+                        log.warning(
+                            "Continuing termination after volume %s detach failed: %s",
+                            volume["_id"],
+                            exc,
+                        )
+                    finally:
+                        await database.volumes.update_one(
+                            {
+                                "_id": str(volume["_id"]),
+                                "attached_instance_id": str(instance.id),
+                            },
+                            {
+                                "$set": {
+                                    "attached_instance_id": None,
+                                    "device_name": None,
+                                    "mount_path": None,
+                                    "node_id": None,
+                                    "last_node_id": str(instance.node_id),
+                                    "updated_at": datetime.now(UTC),
+                                }
+                            },
+                        )
                 await update(operation.id, 40, "Deleting instance on assigned node")
                 await node_jobs.dispatch(
                     instance, "DELETE", {"name": instance.multipass_name}, operation.id
                 )
                 await scheduler.release_instance_capacity(database, instance)
-                await database.volumes.update_many(
-                    {"attached_instance_id": str(instance.id)},
-                    {
-                        "$set": {
-                            "attached_instance_id": None,
-                            "mount_path": None,
-                            "updated_at": datetime.now(UTC),
-                        }
-                    },
-                )
                 await database.instances.update_one(
                     {"_id": str(instance.id)},
                     {
                         "$set": {
                             "deleted_at": datetime.now(UTC),
                             "ipv4_address": None,
+                            "public_endpoint": None,
+                            "public_endpoint_status": "DISABLED",
                             "updated_at": datetime.now(UTC),
                         }
                     },

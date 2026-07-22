@@ -50,25 +50,60 @@ fi
 
 echo "[1/7] Installing KVM, libvirt, Vagrant, and agent dependencies"
 export DEBIAN_FRONTEND=noninteractive
+# A previous installer may have added a HashiCorp source for an Ubuntu release
+# that HashiCorp no longer publishes (for example EOL Ubuntu 23.10/mantic).
+# Remove that source before apt-get update so agent repair remains possible.
+ubuntu_codename="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+hashicorp_release="https://apt.releases.hashicorp.com/dists/${ubuntu_codename}/Release"
+if [[ -f /etc/apt/sources.list.d/hashicorp.list ]] && \
+  ! curl -fsI --connect-timeout 10 "$hashicorp_release" >/dev/null 2>&1; then
+  echo "Disabling unsupported HashiCorp repository for ${ubuntu_codename}."
+  rm -f /etc/apt/sources.list.d/hashicorp.list
+fi
 apt-get update
 apt-get install -y \
-  ca-certificates curl python3 python3-venv python3-pip \
+  ca-certificates curl wget gpg python3 python3-venv python3-pip \
+  sudo \
   qemu-kvm ovmf libvirt-daemon-system libvirt-clients bridge-utils \
-  vagrant build-essential ruby-dev libvirt-dev pkg-config
+  build-essential ruby-dev libvirt-dev pkg-config
+
+# Preserve an already working Vagrant installation during agent-only upgrades.
+# For a fresh host, prefer HashiCorp when it publishes this Ubuntu release and
+# otherwise fall back to Ubuntu's archived/package repository.
+if ! command -v vagrant >/dev/null 2>&1; then
+  if curl -fsI --connect-timeout 10 "$hashicorp_release" >/dev/null 2>&1; then
+    wget -qO- https://apt.releases.hashicorp.com/gpg |
+      gpg --dearmor --yes -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com ${ubuntu_codename} main" \
+      > /etc/apt/sources.list.d/hashicorp.list
+    apt-get update
+  fi
+  apt-get install -y vagrant
+fi
 
 echo "[2/7] Creating the restricted LocalEC2 service account"
 if ! id localec2 >/dev/null 2>&1; then
   useradd --system --create-home --home-dir /var/lib/localec2 \
     --shell /usr/sbin/nologin localec2
 fi
-for group in libvirt kvm; do
+for group in libvirt kvm libvirt-qemu; do
   if getent group "$group" >/dev/null; then
     usermod -aG "$group" localec2
   fi
 done
-install -d -o localec2 -g localec2 -m 0750 /var/lib/localec2
+install -d -o localec2 -g localec2 -m 0751 /var/lib/localec2
+volume_group=libvirt
+getent group libvirt-qemu >/dev/null && volume_group=libvirt-qemu
+install -d -o localec2 -g "$volume_group" -m 2770 /var/lib/localec2/volumes
 install -d -o root -g root -m 0755 /opt/localec2-agent
 install -d -o root -g localec2 -m 0750 /etc/localec2
+# Platform administrators may explicitly request root host commands. Keep this
+# in a dedicated sudoers drop-in so removing the agent also removes the grant.
+cat > /etc/sudoers.d/localec2-agent <<'EOF'
+localec2 ALL=(root) NOPASSWD: ALL
+EOF
+chmod 0440 /etc/sudoers.d/localec2-agent
+visudo -cf /etc/sudoers.d/localec2-agent >/dev/null
 
 echo "[3/7] Enabling the system libvirt daemon and default NAT network"
 systemctl enable --now libvirtd
@@ -104,21 +139,29 @@ if [[ -f /usr/share/vagrant-plugins/plugins.json ]]; then
     echo "Warning: Vagrant's system plugin state could not be initialized." >&2
   fi
 fi
-if ! runuser -u localec2 -- env \
+if runuser -u localec2 -- env \
   HOME=/var/lib/localec2 \
+  VAGRANT_CWD=/var/lib/localec2 \
   VAGRANT_HOME=/var/lib/localec2/.vagrant.d \
   vagrant plugin list 2>/dev/null | grep -q '^vagrant-libvirt '; then
-  if ! runuser -u localec2 -- env \
+  runuser -u localec2 -- env \
     HOME=/var/lib/localec2 \
+    VAGRANT_CWD=/var/lib/localec2 \
     VAGRANT_HOME=/var/lib/localec2/.vagrant.d \
-    vagrant plugin install vagrant-libvirt; then
-    echo "Warning: vagrant-libvirt plugin installation failed; the node will report this capability as unavailable." >&2
-  fi
+    vagrant plugin uninstall vagrant-libvirt || true
+fi
+if ! runuser -u localec2 -- env \
+  HOME=/var/lib/localec2 \
+  VAGRANT_CWD=/var/lib/localec2 \
+  VAGRANT_HOME=/var/lib/localec2/.vagrant.d \
+  vagrant plugin install vagrant-libvirt; then
+  echo "Warning: vagrant-libvirt plugin installation failed; the node will report this capability as unavailable." >&2
 fi
 
 echo "[5/7] Installing the LocalEC2 agent"
 python3 -m venv /opt/localec2-agent/venv
-/opt/localec2-agent/venv/bin/pip install --disable-pip-version-check --no-cache-dir httpx psutil
+/opt/localec2-agent/venv/bin/pip install --disable-pip-version-check --no-cache-dir \
+  httpx psutil websockets
 curl --fail --show-error --silent "$API_URL/agent/agent.py" \
   --output /opt/localec2-agent/agent.py
 chmod 0755 /opt/localec2-agent/agent.py
@@ -129,6 +172,10 @@ echo "[6/7] Writing the protected node configuration"
   printf 'LOCAL_EC2_NODE_ID=%s\n' "$NODE_ID"
   printf 'LOCAL_EC2_NODE_TOKEN=%s\n' "$NODE_TOKEN"
   printf 'LOCAL_EC2_STORAGE_ROOT=/var/lib/localec2\n'
+  printf 'LOCAL_EC2_JOB_CONCURRENCY=3\n'
+  printf 'LOCAL_EC2_AUTO_UPDATE=true\n'
+  printf 'LOCAL_EC2_AUTO_UPDATE_INTERVAL_SECONDS=300\n'
+  printf 'LOCAL_EC2_LAUNCH_TIMEOUT_SECONDS=1800\n'
   printf 'VAGRANT_EXECUTABLE=/usr/bin/vagrant\n'
   printf 'VAGRANT_HOME=/var/lib/localec2/.vagrant.d\n'
   printf 'LIBVIRT_DEFAULT_URI=qemu:///system\n'
@@ -142,7 +189,8 @@ curl --fail --show-error --silent "$API_URL/agent/localec2-agent.service" \
 
 echo "[7/7] Starting the node agent"
 systemctl daemon-reload
-systemctl enable --now localec2-agent
+systemctl enable localec2-agent
+systemctl restart localec2-agent
 sleep 2
 if ! systemctl is-active --quiet localec2-agent; then
   echo "The agent did not start. Recent logs:" >&2

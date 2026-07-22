@@ -11,10 +11,11 @@ EnvironmentFile=/etc/localec2/agent.env
 ExecStart=/opt/localec2-agent/venv/bin/python /opt/localec2-agent/agent.py --interval 15
 Restart=always
 RestartSec=5
-NoNewPrivileges=true
+# HOST_EXEC is administrator-only and may explicitly invoke passwordless sudo.
+NoNewPrivileges=false
 PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
+ProtectHome=false
+ProtectSystem=false
 ReadWritePaths=/var/lib/localec2
 
 [Install]

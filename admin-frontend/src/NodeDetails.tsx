@@ -1,0 +1,50 @@
+import { CSSProperties, ReactNode, useState } from "react";
+import { Activity, ArrowLeft, Cpu, Database, Gauge, HardDrive, Network, RefreshCw, Server, Settings, Terminal, Wifi } from "lucide-react";
+import { HostTerminal } from "./HostTerminal";
+import type { CloudNode, NodeContribution } from "./types";
+
+type Tab = "summary" | "terminal" | "analysis" | "resources" | "setup";
+
+export function NodeDetails({ node, contribution, token, agentUrl, updating, reservationPolicy, onBack, onAgentUrl, onUpdateAgent, onSetup, onApprove, onToggleScheduling, onRemove, onForceRemove }:
+  { node: CloudNode; contribution?: NodeContribution; token: string; agentUrl: string; updating: boolean; reservationPolicy: ReactNode; onBack: () => void; onAgentUrl: (value: string) => void; onUpdateAgent: () => void; onSetup: () => void; onApprove: () => void; onToggleScheduling: () => void; onRemove: () => void; onForceRemove: () => void }) {
+  const [tab, setTab] = useState<Tab>("summary");
+  const tabs: [Tab, typeof Server, string][] = [
+    ["summary", Server, "Summary"], ["terminal", Terminal, "Terminal"],
+    ["analysis", Activity, "Analysis"], ["resources", Gauge, "Resources"],
+    ["setup", Settings, "Setup options"],
+  ];
+  const online = node.status === "ONLINE";
+  const allocatableCpu = Math.max(0, node.cpu_total - node.cpu_reserved);
+  const allocatableMemory = Math.max(0, node.memory_total_mb - node.memory_reserved_mb);
+  const allocatableStorage = Math.max(0, node.storage_total_gb - node.storage_reserved_gb);
+  const cpuPercent = percent(node.cpu_allocated, allocatableCpu);
+  const memoryPercent = percent(node.memory_allocated_mb, allocatableMemory);
+  const storagePercent = percent(node.storage_allocated_gb, allocatableStorage);
+  const readiness = [
+    { label: "Agent", ok: Boolean(node.last_seen_at), value: node.agent_version ?? "missing" },
+    { label: "Approved", ok: node.approved, value: node.approved ? "yes" : "no" },
+    { label: "Scheduling", ok: node.schedulable, value: node.schedulable ? "enabled" : "drained" },
+    { label: "KVM", ok: node.capabilities.includes("kvm"), value: node.capabilities.includes("kvm") ? "ready" : "missing" },
+    { label: "libvirt", ok: node.capabilities.includes("libvirt"), value: node.capabilities.includes("libvirt") ? "ready" : "missing" },
+    { label: "Vagrant", ok: node.capabilities.includes("vagrant"), value: node.capabilities.includes("vagrant") ? "ready" : "missing" },
+  ];
+  return <>
+    <button className="node-back" onClick={onBack}><ArrowLeft />All compute nodes</button>
+    <header className="node-detail-header"><div><span>PHYSICAL COMPUTE NODE</span><h1>{node.name}</h1><p>{node.hostname ?? "Agent not connected"} · {node.availability_zone} · Agent {node.agent_version ?? "unknown"}</p></div><span className={`status ${node.status.toLowerCase()}`}><i />{node.status}</span></header>
+    <div className="node-tabbar"><nav className="node-tabs" aria-label="Node sections">{tabs.map(([id, Icon, label]) => <button className={tab === id ? "active" : ""} onClick={() => setTab(id)} key={id}><Icon />{label}</button>)}</nav></div>
+    {tab === "summary" && <><section className="node-hero-panel"><div><span>NODE HEALTH</span><h2>{online ? "Ready for host operations" : "Waiting for agent heartbeat"}</h2><p>{node.management_address ?? "No management address yet"} · {node.provider_name} · {node.availability_zone}</p></div><div className="node-health-ring" style={{ "--value": `${Math.round((readiness.filter(item => item.ok).length / readiness.length) * 100)}%` } as CSSProperties}><strong>{readiness.filter(item => item.ok).length}/{readiness.length}</strong><span>ready</span></div></section><div className="node-dashboard-grid"><section className="panel"><div className="node-detail-grid"><div><span>Status</span><strong>{node.status}</strong></div><div><span>Provider</span><strong>{node.provider_name}</strong></div><div><span>Management address</span><strong>{node.management_address ?? "—"}</strong></div><div><span>Last heartbeat</span><strong>{node.last_seen_at ? new Date(node.last_seen_at).toLocaleString() : "Never"}</strong></div><div><span>Scheduling</span><strong>{node.approved && node.schedulable ? "Enabled" : node.approved ? "Draining" : "Pending approval"}</strong></div><div><span>Agent</span><strong>{node.agent_version ?? "Not reported"}</strong></div></div></section><section className="panel"><h2>Readiness checks</h2><div className="readiness-list">{readiness.map(item => <div key={item.label}><i className={item.ok ? "ok" : ""} /><span>{item.label}</span><strong>{item.value}</strong></div>)}</div></section></div></>}
+    {tab === "terminal" && <section className="panel"><h2>Root host terminal</h2><p>Interactive root shell on this physical node. Commands affect the host directly.</p>{online ? <HostTerminal nodeId={node.id} token={token} /> : <div className="empty"><h3>Node offline</h3><p>The agent must reconnect before opening a terminal.</p></div>}</section>}
+    {tab === "analysis" && <><section className="panel"><div className="panel-head"><div><h2>Connectivity and capabilities</h2><p>Agent-reported platform features and physical host reachability.</p></div></div><div className="capability-list large">{node.capabilities.length ? node.capabilities.map(value => <span key={value}>{value}</span>) : <span className="muted">Awaiting capability check</span>}</div><div className="node-analysis-grid">{readiness.map(item => <div key={item.label}><span>{item.label}</span><strong>{item.ok ? "Passing" : "Attention"}</strong><small>{item.value}</small></div>)}</div></section><section className="panel"><h2>Network interfaces</h2><div className="node-interface-list">{node.network_interfaces.length ? node.network_interfaces.map(item => <div key={`${item.name}-${item.address}`}><Network /><strong>{item.name}</strong><span>{item.family}</span><code>{item.address}</code></div>) : <div><Wifi /><strong>No interfaces reported</strong><span>—</span><code>waiting for agent</code></div>}</div></section></>}
+    {tab === "resources" && <section className="panel"><div className="node-resource-layout"><div className="resource-donut" style={{ "--cpu": `${cpuPercent}%`, "--memory": `${memoryPercent}%`, "--storage": `${storagePercent}%` } as CSSProperties}><div><strong>{cpuPercent}%</strong><span>CPU used</span></div></div><div className="node-resource-bars"><ResourceBar icon={<Cpu />} label="CPU" used={node.cpu_allocated} total={allocatableCpu} unit="vCPU" detail={`${node.cpu_reserved} reserved from ${node.cpu_total}`} /><ResourceBar icon={<Gauge />} label="Memory" used={node.memory_allocated_mb / 1024} total={allocatableMemory / 1024} unit="GB" detail={`${(node.memory_reserved_mb / 1024).toFixed(1)} GB host-reserved`} /><ResourceBar icon={<HardDrive />} label="Storage" used={node.storage_allocated_gb} total={allocatableStorage} unit="GB" detail={`${node.storage_reserved_gb} GB host-reserved`} /></div></div>{contribution && <div className="node-volume-strip"><div><Database /><span>Instances<strong>{contribution.instances}</strong></span></div><div><HardDrive /><span>Attached volumes<strong>{contribution.attached_volumes}</strong><small>{contribution.attached_volume_gb} GB attached</small></span></div><div><Server /><span>Originated volumes<strong>{contribution.originated_volumes}</strong></span></div></div>}<section className="network-map"><h2>Virtual network map</h2><div>{node.virtual_networks.length ? node.virtual_networks.map(network => <span key={network}>{network}</span>) : <span>No virtual networks reported</span>}</div></section></section>}
+    {tab === "setup" && <div className="setup-dashboard"><section className="panel setup-card"><h2>Capacity reservation</h2>{reservationPolicy}</section><section className="panel setup-card"><h2>Agent and enrollment</h2><p>Update the agent through its outbound job channel or generate fresh reconnect credentials.</p><label className="node-agent-url">Control-plane URL<input value={agentUrl} onChange={event => onAgentUrl(event.target.value)} /></label><div className="agent-code-actions"><button onClick={onSetup}><RefreshCw />Setup / reconnect</button><button className="primary" disabled={!online || updating} onClick={onUpdateAgent}><RefreshCw />{updating ? "Updating..." : "Update agent now"}</button></div></section><section className="panel setup-card danger-zone"><h2>Scheduling and removal</h2><div className="agent-code-actions">{!node.approved ? <button className="primary" onClick={onApprove}>Approve node</button> : <button onClick={onToggleScheduling}>{node.schedulable ? "Drain node" : "Enable scheduling"}</button>}<button onClick={onRemove}>Remove node</button><button className="danger" onClick={onForceRemove}>Force remove node</button></div></section></div>}
+  </>;
+}
+
+function percent(used: number, total: number) {
+  return total ? Math.min(100, Math.round((used * 100) / total)) : 0;
+}
+
+function ResourceBar({ icon, label, used, total, unit, detail }: { icon: ReactNode; label: string; used: number; total: number; unit: string; detail: string }) {
+  const value = percent(used, total);
+  return <div className="resource-row"><div>{icon}</div><span><strong>{label}</strong><small>{detail}</small></span><em>{Number(used.toFixed(1)).toLocaleString()} / {Number(total.toFixed(1)).toLocaleString()} {unit}</em><progress value={value} max="100" /></div>;
+}

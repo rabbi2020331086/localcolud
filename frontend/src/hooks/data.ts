@@ -9,7 +9,9 @@ import type {
   Operation,
   SecurityGroup,
   Template,
+  TargetGroup,
   Volume,
+  VolumeStorageNode,
 } from "../types";
 const get = <T>(url: string) => api.get<T>(url).then((r) => r.data);
 export const useInstances = () =>
@@ -43,6 +45,12 @@ export const useLoadBalancers = () =>
     queryFn: () => get<LoadBalancer[]>("/load-balancers"),
     refetchInterval: 5000,
   });
+export const useTargetGroups = () =>
+  useQuery({
+    queryKey: ["target-groups"],
+    queryFn: () => get<TargetGroup[]>("/target-groups"),
+    refetchInterval: 5000,
+  });
 export const useKeyPairs = () =>
   useQuery({
     queryKey: ["key-pairs"],
@@ -59,10 +67,18 @@ export const useVolumes = () =>
     queryFn: () => get<Volume[]>("/volumes"),
     refetchInterval: 5000,
   });
+export const useVolumeStorageNodes = () =>
+  useQuery({
+    queryKey: ["volume-storage-nodes"],
+    queryFn: () => get<VolumeStorageNode[]>("/volumes/storage-nodes"),
+    refetchInterval: 10000,
+  });
 export const useAmis = () =>
   useQuery({
     queryKey: ["amis"],
     queryFn: () => get<Ami[]>("/amis"),
+    refetchInterval: (query) =>
+      query.state.data?.some((ami) => ami.status === "CREATING") ? 3000 : false,
   });
 export function useInstanceAction() {
   const qc = useQueryClient();

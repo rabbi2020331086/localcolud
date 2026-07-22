@@ -1,3 +1,6 @@
+import shlex
+from datetime import UTC, datetime
+from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
@@ -5,12 +8,204 @@ from pymongo.errors import DuplicateKeyError
 
 from app.api.dependencies import PlatformAdmin, PlatformOperator
 from app.api.routes.nodes import observed_status
+from app.core.config import settings
 from app.core.security import hash_password
 from app.infrastructure.database import Database, from_document, from_documents, to_document
-from app.infrastructure.models import CloudNode, Instance, Operation, PlatformRole, User
-from app.schemas import TeamMemberCreate, TeamMemberOut, TeamMemberUpdate
+from app.infrastructure.metrics import CPU_PERCENT_COMMAND
+from app.infrastructure.models import (
+    CloudNode,
+    Instance,
+    InstanceStatus,
+    Operation,
+    OperationStatus,
+    OperationType,
+    PlatformRole,
+    User,
+    Volume,
+)
+from app.infrastructure.vm import ProviderUnavailable
+from app.schemas import (
+    AgentUpdateIn,
+    HostCommandIn,
+    TeamMemberCreate,
+    TeamMemberOut,
+    TeamMemberUpdate,
+)
+from app.services import node_jobs, scheduler
 
 router = APIRouter(prefix="/admin", tags=["Platform administration"])
+
+
+@router.post("/nodes/{node_id}/update-agent")
+async def update_node_agent(
+    node_id: UUID, data: AgentUpdateIn, admin: PlatformAdmin, database: Database
+) -> dict[str, object]:
+    node = from_document(CloudNode, await database.cloud_nodes.find_one({"_id": str(node_id)}))
+    if not node:
+        raise HTTPException(404, "Cloud node not found")
+    if observed_status(node).value != "ONLINE":
+        raise HTTPException(409, "The node must be online to update its agent remotely")
+    try:
+        if node.agent_version and tuple(
+            int(part) for part in node.agent_version.split(".") if part.isdigit()
+        ) >= (0, 5, 4):
+            result = await node_jobs.dispatch_node(
+                node,
+                "AGENT_UPDATE",
+                {"control_plane_url": data.control_plane_url},
+                timeout=180,
+            )
+        else:
+            base = shlex.quote(data.control_plane_url)
+            bootstrap = (
+                "set -e; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; "
+                f"curl -fsSL {base}/agent/agent.py -o \"$d/agent.py\"; "
+                f"curl -fsSL {base}/agent/localec2-agent.service "
+                "-o \"$d/localec2-agent.service\"; "
+                "install -o root -g root -m 0755 \"$d/agent.py\" "
+                "/opt/localec2-agent/agent.py; "
+                "install -o root -g root -m 0644 \"$d/localec2-agent.service\" "
+                "/etc/systemd/system/localec2-agent.service; "
+                "systemd-run --unit=localec2-agent-bootstrap-update "
+                "--on-active=10s /bin/sh -c "
+                + shlex.quote("systemctl daemon-reload && systemctl restart localec2-agent")
+            )
+            await node_jobs.dispatch_node(
+                node,
+                "HOST_EXEC",
+                {"command": bootstrap, "timeout": 120, "run_as_root": True},
+                timeout=180,
+            )
+            result = {"updated": True, "version": "latest", "restart_in_seconds": 10}
+    except ProviderUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return {
+        **result,
+        "node_id": str(node.id),
+        "requested_by": str(admin.id),
+        "message": "Agent files updated; service restart has been scheduled",
+    }
+
+
+@router.post("/nodes/{node_id}/execute")
+async def execute_host_command(
+    node_id: UUID, data: HostCommandIn, admin: PlatformAdmin, database: Database
+) -> dict[str, object]:
+    """Run an audited command on a node host. Restricted to full administrators."""
+    node = from_document(CloudNode, await database.cloud_nodes.find_one({"_id": str(node_id)}))
+    if not node:
+        raise HTTPException(404, "Cloud node not found")
+    if observed_status(node).value != "ONLINE":
+        raise HTTPException(409, "The compute node is offline or unavailable")
+    try:
+        result = await node_jobs.dispatch_node(
+            node,
+            "HOST_EXEC",
+            {
+                "command": data.command,
+                "timeout": data.timeout_seconds,
+                "run_as_root": data.run_as_root,
+            },
+            timeout=data.timeout_seconds + 30,
+        )
+    except ProviderUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return {
+        "node_id": str(node.id),
+        "command": data.command,
+        "run_as_root": data.run_as_root,
+        "stdout": result.get("stdout", ""),
+        "stderr": result.get("stderr", ""),
+        "exit_code": result.get("exit_code", 0),
+    }
+
+
+@router.post("/nodes/{node_id}/force-remove")
+async def force_remove_node(
+    node_id: UUID, admin: PlatformAdmin, database: Database
+) -> dict[str, object]:
+    """Remove a node and all of its control-plane dependencies without waiting for agents."""
+    node = from_document(CloudNode, await database.cloud_nodes.find_one({"_id": str(node_id)}))
+    if not node:
+        raise HTTPException(404, "Cloud node not found")
+    now = datetime.now(UTC)
+    instances = from_documents(
+        Instance,
+        await database.instances.find({"node_id": str(node.id), "deleted_at": None}).to_list(None),
+    )
+    instance_ids = [str(instance.id) for instance in instances]
+    if instance_ids:
+        await database.operations.update_many(
+            {
+                "instance_id": {"$in": instance_ids},
+                "status": {"$in": [OperationStatus.PENDING, OperationStatus.RUNNING]},
+            },
+            {"$set": {
+                "status": OperationStatus.FAILED,
+                "progress": 100,
+                "message": "Cancelled by forced node removal",
+                "error_code": "ADMIN_FORCE_REMOVED_NODE",
+                "error_message": (
+                    f"Node {node.name} was force removed by platform administrator {admin.id}"
+                ),
+                "finished_at": now,
+            }},
+        )
+        await database.instances.update_many(
+            {"_id": {"$in": instance_ids}},
+            {"$set": {
+                "status": InstanceStatus.TERMINATING,
+                "capacity_reserved": False,
+                "deleted_at": now,
+                "ipv4_address": None,
+                "public_endpoint": None,
+                "public_endpoint_status": "DISABLED",
+                "last_error": f"Assigned node {node.name} was force removed",
+                "updated_at": now,
+            }},
+        )
+    jobs = await database.node_jobs.count_documents(
+        {"node_id": str(node.id), "status": {"$in": ["QUEUED", "LEASED"]}}
+    )
+    await database.node_jobs.update_many(
+        {"node_id": str(node.id), "status": {"$in": ["QUEUED", "LEASED"]}},
+        {"$set": {
+            "status": "FAILED",
+            "error_message": "Cancelled because the compute node was force removed",
+            "lease_expires_at": None,
+            "finished_at": now,
+            "updated_at": now,
+        }},
+    )
+    volumes = await database.volumes.count_documents({"node_id": str(node.id)})
+    await database.volumes.update_many(
+        {"node_id": str(node.id)},
+        {"$set": {
+            "attached_instance_id": None,
+            "device_name": None,
+            "mount_path": None,
+            "node_id": None,
+            "last_node_id": str(node.id),
+            "updated_at": now,
+        }, "$unset": {"attachment_pending": ""}},
+    )
+    # Canonical AMI packages remain launchable. Only their former capture-node
+    # association is cleared.
+    await database.amis.update_many(
+        {"node_id": str(node.id)}, {"$set": {"node_id": None, "updated_at": now}}
+    )
+    await database.cloud_nodes.delete_one({"_id": str(node.id)})
+    return {
+        "removed": True,
+        "node": node.name,
+        "instances_removed": len(instances),
+        "volumes_detached": volumes,
+        "jobs_cancelled": jobs,
+        "warning": (
+            "The physical host was not contacted. Running VMs and unsynchronized attached-volume "
+            "data may remain on that host; only canonical detached copies are recoverable."
+        ),
+    }
 
 
 def member_output(user: User) -> TeamMemberOut:
@@ -91,16 +286,345 @@ async def all_instances(admin: PlatformOperator, database: Database) -> list[dic
                 "status": item.status,
                 "owner": owner.email if owner else "Unknown",
                 "node": node.name if node else None,
+                "node_id": str(node.id) if node else None,
                 "zone": node.availability_zone if node else None,
                 "provider": item.provider_name,
                 "ipv4_address": item.ipv4_address,
+                "instance_type": item.instance_type,
+                "last_error": item.last_error,
+                "autoscaling_group_id": (
+                    str(item.autoscaling_group_id) if item.autoscaling_group_id else None
+                ),
                 "cpu_count": item.cpu_count,
                 "memory_mb": item.memory_mb,
                 "disk_gb": item.disk_gb,
                 "created_at": item.created_at,
+                "updated_at": item.updated_at,
             }
         )
     return result
+
+
+async def admin_instance(database: Database, instance_id: UUID) -> Instance:
+    row = from_document(
+        Instance,
+        await database.instances.find_one({"_id": str(instance_id), "deleted_at": None}),
+    )
+    if not row:
+        raise HTTPException(404, "Instance not found")
+    return row
+
+
+@router.post("/instances/{instance_id}/{action}")
+async def control_instance(
+    instance_id: UUID,
+    action: str,
+    admin: PlatformOperator,
+    database: Database,
+) -> dict[str, object]:
+    item = await admin_instance(database, instance_id)
+    active = await database.operations.find_one(
+        {
+            "instance_id": str(item.id),
+            "status": {"$in": [OperationStatus.PENDING, OperationStatus.RUNNING]},
+        }
+    )
+    if active:
+        raise HTTPException(409, "Another operation is already active for this instance")
+    allowed: dict[str, tuple[set[InstanceStatus], OperationType]] = {
+        "start": ({InstanceStatus.STOPPED, InstanceStatus.HIBERNATED}, OperationType.START),
+        "stop": ({InstanceStatus.RUNNING}, OperationType.STOP),
+        "hibernate": ({InstanceStatus.RUNNING}, OperationType.HIBERNATE),
+        "terminate": (
+            {
+                InstanceStatus.RUNNING,
+                InstanceStatus.STOPPED,
+                InstanceStatus.HIBERNATED,
+                InstanceStatus.ERROR,
+                InstanceStatus.UNKNOWN,
+            },
+            OperationType.TERMINATE,
+        ),
+    }
+    definition = allowed.get(action)
+    if not definition:
+        raise HTTPException(404, "Unsupported instance action")
+    statuses, operation_type = definition
+    if item.status not in statuses:
+        raise HTTPException(409, f"Instance cannot {action} from {item.status}")
+    scheduler.require_distributed(item)
+    operation = Operation(
+        user_id=item.user_id,
+        instance_id=item.id,
+        operation_type=operation_type,
+        request_payload={"requested_by_platform_admin": str(admin.id)},
+    )
+    await database.operations.insert_one(to_document(operation))
+    return {"operation_id": str(operation.id), "status": operation.status}
+
+
+@router.post("/instances/{instance_id}/force/remove")
+async def force_remove_instance(
+    instance_id: UUID, admin: PlatformAdmin, database: Database
+) -> dict[str, object]:
+    """Cancel control-plane work, best-effort destroy the VM, and remove its reservation."""
+    item = await admin_instance(database, instance_id)
+    now = datetime.now(UTC)
+    await database.operations.update_many(
+        {
+            "instance_id": str(item.id),
+            "status": {"$in": [OperationStatus.PENDING, OperationStatus.RUNNING]},
+        },
+        {"$set": {
+            "status": OperationStatus.FAILED,
+            "progress": 100,
+            "message": "Cancelled by platform administrator",
+            "error_code": "ADMIN_FORCE_REMOVED",
+            "error_message": f"Force removed by platform administrator {admin.id}",
+            "finished_at": now,
+        }},
+    )
+    await database.node_jobs.update_many(
+        {"instance_id": str(item.id), "status": {"$in": ["QUEUED", "LEASED"]}},
+        {"$set": {
+            "status": "FAILED",
+            "error_message": "Cancelled by platform administrator force removal",
+            "lease_expires_at": None,
+            "finished_at": now,
+            "updated_at": now,
+        }},
+    )
+    cleanup_error = None
+    if item.node_id:
+        node = from_document(
+            CloudNode, await database.cloud_nodes.find_one({"_id": str(item.node_id)})
+        )
+        if node and observed_status(node).value == "ONLINE":
+            try:
+                await node_jobs.dispatch_node(
+                    node, "DELETE", {"name": item.multipass_name}, timeout=600
+                )
+            except Exception as exc:
+                cleanup_error = str(exc)[:1000]
+    await database.volumes.update_many(
+        {"attached_instance_id": str(item.id)},
+        {"$set": {
+            "attached_instance_id": None,
+            "device_name": None,
+            "mount_path": None,
+            "node_id": None,
+            "last_node_id": str(item.node_id) if item.node_id else None,
+            "updated_at": now,
+        }},
+    )
+    await scheduler.release_instance_capacity(database, item)
+    await database.instances.update_one(
+        {"_id": str(item.id)},
+        {"$set": {
+            "status": InstanceStatus.TERMINATING,
+            "deleted_at": now,
+            "ipv4_address": None,
+            "public_endpoint": None,
+            "public_endpoint_status": "DISABLED",
+            "last_error": cleanup_error,
+            "updated_at": now,
+        }},
+    )
+    return {"removed": True, "host_cleanup_error": cleanup_error}
+
+
+@router.get("/instances/{instance_id}/diagnostics")
+async def instance_diagnostics(
+    instance_id: UUID,
+    admin: PlatformOperator,
+    database: Database,
+) -> dict[str, object]:
+    item = await admin_instance(database, instance_id)
+    scheduler.require_distributed(item)
+    inspect = await node_jobs.dispatch(item, "INSPECT", {"name": item.multipass_name}, timeout=90)
+    metrics = None
+    if str(inspect.get("state", "")).lower() == "running":
+        output = await node_jobs.remote_exec(
+            item,
+            CPU_PERCENT_COMMAND + "; echo; free -m | awk 'NR==2{printf \"%.1f\",$3*100/$2}'; "
+            "echo; df -P / | awk 'NR==2{print $5}'",
+            timeout=30,
+        )
+        values = output.strip().splitlines()[-3:]
+        metrics = {
+            "cpu_percent": float(values[0]),
+            "memory_percent": float(values[1]),
+            "root_disk_percent": values[2],
+        }
+    jobs = (
+        await database.node_jobs.find({"instance_id": str(item.id)})
+        .sort("created_at", -1)
+        .limit(10)
+        .to_list(None)
+    )
+    return {
+        "instance_id": str(item.id),
+        "inspect": inspect,
+        "metrics": metrics,
+        "recent_jobs": [
+            {
+                "id": str(job["_id"]),
+                "type": job["job_type"],
+                "status": job["status"],
+                "error": job.get("error_message"),
+                "created_at": job["created_at"],
+            }
+            for job in jobs
+        ],
+    }
+
+
+@router.get("/volumes")
+async def all_volumes(admin: PlatformOperator, database: Database) -> list[dict[str, object]]:
+    volumes = from_documents(
+        Volume, await database.volumes.find({}).sort("created_at", -1).to_list(None)
+    )
+    users = {
+        str(item.id): item.email
+        for item in from_documents(User, await database.users.find({}).to_list(None))
+    }
+    nodes = {
+        str(item.id): item.name
+        for item in from_documents(CloudNode, await database.cloud_nodes.find({}).to_list(None))
+    }
+    instances = {
+        str(item.id): item.display_name
+        for item in from_documents(
+            Instance,
+            await database.instances.find(
+                {
+                    "_id": {
+                        "$in": [
+                            str(volume.attached_instance_id)
+                            for volume in volumes
+                            if volume.attached_instance_id
+                        ]
+                    }
+                }
+            ).to_list(None),
+        )
+    }
+    return [
+        {
+            "id": str(volume.id),
+            "name": volume.name,
+            "owner": users.get(str(volume.user_id), "Unknown"),
+            "size_gb": volume.size_gb,
+            "availability_zone": volume.availability_zone,
+            "storage_backend": volume.storage_backend,
+            "origin_node": nodes.get(str(volume.origin_node_id)) if volume.origin_node_id else None,
+            "current_node": nodes.get(str(volume.node_id)) if volume.node_id else None,
+            "last_node": nodes.get(str(volume.last_node_id)) if volume.last_node_id else None,
+            "attached_instance": (
+                instances.get(str(volume.attached_instance_id))
+                if volume.attached_instance_id
+                else None
+            ),
+            "attached_instance_id": (
+                str(volume.attached_instance_id) if volume.attached_instance_id else None
+            ),
+            "device_name": volume.device_name,
+            "mount_path": volume.mount_path,
+            "canonical_present": (
+                Path(settings.volume_storage_root).expanduser().resolve() / f"{volume.id}.qcow2"
+            ).is_file(),
+            "created_at": volume.created_at,
+            "updated_at": volume.updated_at,
+        }
+        for volume in volumes
+    ]
+
+
+@router.post("/volumes/{volume_id}/detach")
+async def admin_detach_volume(
+    volume_id: UUID,
+    admin: PlatformOperator,
+    database: Database,
+) -> dict[str, object]:
+    volume = from_document(Volume, await database.volumes.find_one({"_id": str(volume_id)}))
+    if not volume:
+        raise HTTPException(404, "Volume not found")
+    if not volume.attached_instance_id:
+        return {"status": "AVAILABLE"}
+    item = await admin_instance(database, volume.attached_instance_id)
+    if item.status != InstanceStatus.RUNNING:
+        raise HTTPException(409, "Start the attached instance before detaching its volume")
+    await node_jobs.dispatch(
+        item,
+        "VOLUME_DETACH",
+        {
+            "name": item.multipass_name,
+            "mount_path": volume.mount_path or "/mnt/data",
+            "device_name": volume.device_name or "vdb",
+            "volume_id": str(volume.id),
+        },
+        timeout=600,
+    )
+    await database.volumes.update_one(
+        {"_id": str(volume.id)},
+        {
+            "$set": {
+                "attached_instance_id": None,
+                "device_name": None,
+                "mount_path": None,
+                "node_id": None,
+                "last_node_id": str(item.node_id),
+                "updated_at": datetime.now(UTC),
+            }
+        },
+    )
+    return {"status": "AVAILABLE"}
+
+
+@router.delete("/volumes/{volume_id}", status_code=204)
+async def admin_delete_volume(
+    volume_id: UUID,
+    admin: PlatformOperator,
+    database: Database,
+) -> None:
+    volume = from_document(Volume, await database.volumes.find_one({"_id": str(volume_id)}))
+    if not volume:
+        raise HTTPException(404, "Volume not found")
+    if volume.attached_instance_id:
+        raise HTTPException(409, "Detach the volume before deleting it")
+    canonical = Path(settings.volume_storage_root).expanduser().resolve() / f"{volume.id}.qcow2"
+    canonical.unlink(missing_ok=True)
+    await database.volumes.delete_one({"_id": str(volume.id)})
+
+
+@router.get("/node-contributions")
+async def node_contributions(
+    admin: PlatformOperator, database: Database
+) -> list[dict[str, object]]:
+    nodes = from_documents(CloudNode, await database.cloud_nodes.find({}).to_list(None))
+    instances = await database.instances.find({"deleted_at": None}).to_list(None)
+    volumes = await database.volumes.find({}).to_list(None)
+    return [
+        {
+            "node_id": str(node.id),
+            "node": node.name,
+            "zone": node.availability_zone,
+            "status": observed_status(node),
+            "cpu_contributed": max(0, node.cpu_total - node.cpu_reserved),
+            "cpu_allocated": node.cpu_allocated,
+            "memory_contributed_mb": max(0, node.memory_total_mb - node.memory_reserved_mb),
+            "memory_allocated_mb": node.memory_allocated_mb,
+            "storage_contributed_gb": max(0, node.storage_total_gb - node.storage_reserved_gb),
+            "storage_allocated_gb": node.storage_allocated_gb,
+            "instances": sum(row.get("node_id") == str(node.id) for row in instances),
+            "attached_volumes": sum(row.get("node_id") == str(node.id) for row in volumes),
+            "attached_volume_gb": sum(
+                int(row.get("size_gb", 0)) for row in volumes if row.get("node_id") == str(node.id)
+            ),
+            "originated_volumes": sum(row.get("origin_node_id") == str(node.id) for row in volumes),
+        }
+        for node in nodes
+    ]
 
 
 @router.get("/operations")
@@ -171,6 +695,8 @@ async def update_member(
         "platform_roles": [role.value for role in data.platform_roles],
         "is_platform_admin": PlatformRole.ADMINISTRATOR in data.platform_roles,
         "is_active": data.is_active,
+        "can_view_agent_code": data.can_view_agent_code or data.can_edit_agent_code,
+        "can_edit_agent_code": data.can_edit_agent_code,
     }
     await database.users.update_one({"_id": str(user.id)}, {"$set": changes})
     return member_output(User.model_validate({**user.model_dump(), **changes}))

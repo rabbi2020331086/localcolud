@@ -62,7 +62,8 @@ Development admin login is `admin` / `admin`; the first login forces a password 
 6. Set the capacity reserved for Ubuntu/agent overhead, then click Approve.
 
 The installer adds KVM, libvirt, Vagrant, `vagrant-libvirt`, a restricted `localec2` account, and a
-systemd agent. It opens no inbound management port; the node polls the API over HTTP(S).
+systemd agent. It opens no inbound management port; jobs poll over HTTP(S) and interactive terminals
+use an outbound authenticated reverse WebSocket.
 
 ```bash
 systemctl status localec2-agent
@@ -83,19 +84,55 @@ autoscaling commands are executed by the assigned node agent.
 
 Ubuntu 24.04, Ubuntu 22.04, and Debian 12 are available through versioned Bento Vagrant boxes. The
 Vagrant guest user is `vagrant`. Guest addresses currently come from each node's libvirt network,
-so direct SSH requires routing/VPN access to that guest network. The browser interactive PTY is
-disabled until a reverse terminal channel is implemented.
+so direct SSH requires routing/VPN access to that guest network. Browser terminals do not require
+guest-network routing or physical-node credentials because their PTY is relayed by the assigned
+compute agent after the control plane verifies instance ownership.
+
+### Public endpoints with Tailscale
+
+Set `TAILSCALE_REUSABLE_AUTH_KEY` in `backend/.env` to a reusable, pre-approved auth key. The launch
+worker installs Tailscale inside every VM, registers a unique
+`instance-<id>` device, enables Funnel for port 80, and records its Tailscale IPv4, MagicDNS name,
+and public HTTPS endpoint. The enrollment secret travels in a dedicated node job whose stored
+payload is redacted immediately after completion.
+
+Enable MagicDNS, HTTPS, and Funnel in the Tailscale admin console before launching. Tagging is
+optional: set `TAILSCALE_INSTANCE_TAG=tag:localec2-instance` only after defining a matching
+`tagOwner` and Funnel permission in the tailnet policy and generating a key allowed to apply it.
+Funnel publishes the configured port but does not install a website; the image or customer startup
+data must run an HTTP service on port 80. Security-group ingress must allow the target port.
+
+Load balancers use AWS-style target groups. A group can register selected running instances or
+track an Auto Scaling Group. Creating a load balancer reserves a small managed appliance VM,
+using the cached Ubuntu 22.04 image, installs HAProxy, joins it to the tailnet, publishes its
+listener through Funnel, and continuously synchronizes its Tailscale targets. Managed appliances
+are hidden from the instance list and are terminated with their load balancer.
 
 ## Current feature boundary
 
-Real distributed compute, approval, scheduling, lifecycle, monitoring, security-group guest rules,
-autoscaling, load-balancer target health/configuration, team RBAC, and one-time SSH keys are
-implemented. The public load-balancer listener/gateway is still a separate networking milestone.
+Real distributed compute, approval, scheduling, lifecycle, reverse browser terminals, monitoring,
+security-group guest rules, autoscaling with event history, load-balancer health/routing tests, team
+RBAC, one-time SSH keys, and movable persistent block volumes are implemented. Distributed launch
+templates carry instance type, sizing, images, security groups, SSH policy, startup data, and a set
+of availability zones used for balanced autoscaling placement.
 
-AMI mutation and EBS-style volumes are intentionally disabled. Correct multi-node persistence needs
-a replicated storage layer (for example Ceph RBD/CephFS), image replication, fencing, backups, and
-recovery testing; old host-directory records are shown read-only rather than presented as durable
-cloud storage.
+Volumes attach locally for QEMU performance, synchronize their qcow2 backing image to canonical
+control-plane storage on detach, and can then attach to an instance on another node. They survive
+instance deletion and were verified across two physical nodes. They are single-attach and do not
+provide synchronous replication while attached; automatic node-failure recovery still requires a
+replicated backend such as Ceph RBD, fencing, backups, and recovery testing. AMI mutation remains
+disabled.
+
+Agent 0.5.4 adds safe remote self-updates, explicitly gated administrator-only sudo host commands, and replicated AMI package transfer in addition to
+reverse PTY, portable volume jobs, and secure Tailscale/Funnel provisioning. Upgrade an
+existing node without rotating its token:
+
+```bash
+sudo /opt/localec2-agent/venv/bin/pip install websockets
+sudo curl -fsSL http://CONTROL-PLANE:8000/api/v1/agent/agent.py \
+  -o /opt/localec2-agent/agent.py
+sudo systemctl restart localec2-agent
+```
 
 ## Verification
 

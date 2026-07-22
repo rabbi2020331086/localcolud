@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -9,12 +10,13 @@ from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSoc
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.dependencies import has_platform_admin_access
 from app.api.router import router
 from app.core.config import settings
-from app.core.security import decode_jwt
+from app.core.security import decode_jwt, token_hash
 from app.infrastructure.database import close_database, database, from_document, initialize_database
 from app.infrastructure.metrics import CPU_PERCENT_COMMAND
-from app.infrastructure.models import Instance, InstanceStatus
+from app.infrastructure.models import CloudNode, Instance, InstanceStatus, User
 from app.services import autoscaling as autoscaling_service
 from app.services import load_balancing as load_balancing_service
 from app.services import node_jobs
@@ -22,6 +24,21 @@ from app.services import operations as operation_service
 from app.services import reconciliation as reconciliation_service
 
 log = logging.getLogger("localec2")
+
+
+class AgentTerminalChannel:
+    def __init__(self, websocket: WebSocket) -> None:
+        self.websocket = websocket
+        self.lock = asyncio.Lock()
+
+    async def send(self, message: dict[str, object]) -> None:
+        async with self.lock:
+            await self.websocket.send_json(message)
+
+
+terminal_agents: dict[uuid.UUID, AgentTerminalChannel] = {}
+terminal_clients: dict[str, WebSocket] = {}
+terminal_session_nodes: dict[str, uuid.UUID] = {}
 
 
 @asynccontextmanager
@@ -197,9 +214,140 @@ async def terminal_ws(websocket: WebSocket) -> None:
     if item.status != InstanceStatus.RUNNING:
         await websocket.close(4409)
         return
+    if not item.node_id:
+        await websocket.close(4404)
+        return
+    channel = terminal_agents.get(item.node_id)
+    if not channel:
+        await websocket.close(4410, "Compute node terminal channel is offline")
+        return
     await websocket.accept(subprotocol=getattr(websocket.state, "auth_protocol", None))
-    await websocket.send_text(
-        "Interactive PTY is disabled for distributed nodes. Use the instance SSH address and "
-        "downloaded key; reverse agent terminal streaming is not configured yet.\r\n"
+    session_id = str(uuid.uuid4())
+    terminal_clients[session_id] = websocket
+    terminal_session_nodes[session_id] = item.node_id
+    try:
+        await channel.send(
+            {
+                "type": "start",
+                "session_id": session_id,
+                "name": item.multipass_name,
+                "rows": 30,
+                "cols": 120,
+            }
+        )
+        while True:
+            message = await websocket.receive_json()
+            kind = message.get("type")
+            if kind not in ("input", "resize"):
+                continue
+            await channel.send({**message, "session_id": session_id})
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        terminal_clients.pop(session_id, None)
+        terminal_session_nodes.pop(session_id, None)
+        try:
+            await channel.send({"type": "close", "session_id": session_id})
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/admin/nodes/{node_id}/terminal")
+async def admin_terminal_ws(websocket: WebSocket) -> None:
+    identity = ws_identity(websocket)
+    try:
+        if not identity:
+            raise ValueError("Invalid identity")
+        user_id, auth_protocol = identity
+        admin = from_document(User, await database.users.find_one({"_id": str(user_id)}))
+        node_id = uuid.UUID(websocket.path_params["node_id"])
+        node = from_document(CloudNode, await database.cloud_nodes.find_one({"_id": str(node_id)}))
+        if not admin or not has_platform_admin_access(admin) or not node:
+            raise ValueError("Unauthorized")
+    except Exception:
+        await websocket.close(4401)
+        return
+    channel = terminal_agents.get(node_id)
+    if not channel:
+        await websocket.close(4410, "Compute node terminal channel is offline")
+        return
+    await websocket.accept(subprotocol=auth_protocol)
+    session_id = str(uuid.uuid4())
+    terminal_clients[session_id] = websocket
+    terminal_session_nodes[session_id] = node_id
+    try:
+        await channel.send({
+            "type": "start", "target": "host", "session_id": session_id,
+            "rows": 30, "cols": 120,
+        })
+        while True:
+            message = await websocket.receive_json()
+            if message.get("type") in ("input", "resize"):
+                await channel.send({**message, "session_id": session_id})
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        terminal_clients.pop(session_id, None)
+        terminal_session_nodes.pop(session_id, None)
+        try:
+            await channel.send({"type": "close", "session_id": session_id})
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/agent/nodes/{node_id}/terminal")
+async def agent_terminal_ws(websocket: WebSocket) -> None:
+    protocol = next(
+        (
+            value.strip()
+            for value in websocket.headers.get("sec-websocket-protocol", "").split(",")
+            if value.strip().startswith("localec2-node.")
+        ),
+        None,
     )
-    await websocket.close(4410)
+    try:
+        node_id = uuid.UUID(websocket.path_params["node_id"])
+        supplied = token_hash((protocol or "").removeprefix("localec2-node."))
+        node = from_document(CloudNode, await database.cloud_nodes.find_one({"_id": str(node_id)}))
+        if not protocol or not node or not hmac.compare_digest(node.agent_token_hash, supplied):
+            raise ValueError("Invalid node identity")
+    except Exception:
+        await websocket.close(4401)
+        return
+    await websocket.accept(subprotocol=protocol)
+    channel = AgentTerminalChannel(websocket)
+    previous = terminal_agents.get(node_id)
+    terminal_agents[node_id] = channel
+    if previous:
+        try:
+            await previous.websocket.close(4001, "Replaced by a newer agent connection")
+        except Exception:
+            pass
+    try:
+        while True:
+            message = await websocket.receive_json()
+            session_id = str(message.get("session_id") or "")
+            client = terminal_clients.get(session_id)
+            if not client:
+                if message.get("type") not in ("exit", "error"):
+                    await channel.send({"type": "close", "session_id": session_id})
+                continue
+            await client.send_json(message)
+            if message.get("type") in ("exit", "error"):
+                terminal_clients.pop(session_id, None)
+                terminal_session_nodes.pop(session_id, None)
+                await client.close(1000 if message.get("type") == "exit" else 1011)
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        if terminal_agents.get(node_id) is channel:
+            terminal_agents.pop(node_id, None)
+        for session_id, client in list(terminal_clients.items()):
+            if terminal_session_nodes.get(session_id) != node_id:
+                continue
+            try:
+                await client.close(1012, "Compute node terminal channel disconnected")
+            except Exception:
+                pass
+            terminal_clients.pop(session_id, None)
+            terminal_session_nodes.pop(session_id, None)

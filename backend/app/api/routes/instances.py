@@ -1,6 +1,5 @@
-from datetime import UTC, datetime
 import shlex
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
@@ -12,12 +11,13 @@ from app.infrastructure.database import Database, from_document, from_documents,
 from app.infrastructure.metrics import CPU_PERCENT_COMMAND
 from app.infrastructure.models import (
     Ami,
+    AmiStatus,
     Instance,
     InstanceStatus,
+    OneTimeSecret,
     Operation,
     OperationStatus,
     OperationType,
-    OneTimeSecret,
 )
 from app.infrastructure.vm import safe_name
 from app.schemas import AcceptedOut, InstanceCreate, InstanceOut, ZoneCapacityOut
@@ -25,6 +25,13 @@ from app.services import node_jobs, scheduler
 from app.services.operations import key_pair
 
 router = APIRouter(prefix="/instances", tags=["Instances"])
+
+
+async def reject_active_ami_capture(instance_id: UUID, database: Database) -> None:
+    if await database.amis.find_one(
+        {"source_instance_id": str(instance_id), "status": "CREATING"}, {"_id": 1}
+    ):
+        raise HTTPException(409, "Instance actions are locked while its AMI is being captured")
 
 
 async def owned(database: Database, user_id: UUID, instance_id: UUID) -> Instance:
@@ -58,7 +65,13 @@ async def enqueue(
 @router.get("", response_model=list[InstanceOut])
 async def list_instances(user: CurrentUser, database: Database) -> list[Instance]:
     documents = (
-        await database.instances.find({"user_id": str(user.id), "deleted_at": None})
+        await database.instances.find(
+            {
+                "user_id": str(user.id),
+                "deleted_at": None,
+                "$or": [{"system_role": "customer"}, {"system_role": {"$exists": False}}],
+            }
+        )
         .sort("created_at", -1)
         .to_list(length=None)
     )
@@ -72,9 +85,19 @@ async def capacity_zones(user: CurrentUser, database: Database) -> list[ZoneCapa
 
 @router.post("", response_model=AcceptedOut, status_code=202)
 async def create(data: InstanceCreate, user: CurrentUser, database: Database) -> AcceptedOut:
-    count = await database.instances.count_documents({"user_id": str(user.id), "deleted_at": None})
+    count = await database.instances.count_documents(
+        {
+            "user_id": str(user.id),
+            "deleted_at": None,
+            "$or": [{"system_role": "customer"}, {"system_role": {"$exists": False}}],
+        }
+    )
     if count >= settings.max_total_instances:
         raise HTTPException(409, "Instance limit reached")
+    if data.launch_template_id and not await database.launch_templates.find_one(
+        {"_id": str(data.launch_template_id), "user_id": str(user.id)}
+    ):
+        raise HTTPException(404, "Launch template not found")
     ami = None
     if data.ami_id:
         ami = from_document(
@@ -83,12 +106,10 @@ async def create(data: InstanceCreate, user: CurrentUser, database: Database) ->
         )
         if not ami:
             raise HTTPException(404, "AMI not found")
+        if ami.status != AmiStatus.AVAILABLE:
+            raise HTTPException(409, "AMI is not available for launching yet")
         if data.disk_gb < ami.disk_gb:
             raise HTTPException(422, f"Disk must be at least {ami.disk_gb} GB for this AMI")
-        raise HTTPException(
-            409,
-            "Distributed AMI launch is disabled until node image replication is configured",
-        )
     if data.key_pair_id and not await database.key_pairs.find_one(
         {"_id": str(data.key_pair_id), "user_id": str(user.id)}
     ):
@@ -113,6 +134,7 @@ async def create(data: InstanceCreate, user: CurrentUser, database: Database) ->
         security_group_ids=data.security_group_ids,
         availability_zone="pending-placement",
     )
+    item.public_hostname = f"instance-{str(item.id).replace('-', '')[:12]}"
     operation = Operation(
         user_id=user.id,
         instance_id=item.id,
@@ -140,6 +162,7 @@ async def get(instance_id: UUID, user: CurrentUser, database: Database) -> Insta
 @router.post("/{instance_id}/start", response_model=AcceptedOut, status_code=202)
 async def start(instance_id: UUID, user: CurrentUser, database: Database) -> AcceptedOut:
     item = await owned(database, user.id, instance_id)
+    await reject_active_ami_capture(instance_id, database)
     scheduler.require_distributed(item)
     if item.status not in (InstanceStatus.STOPPED, InstanceStatus.HIBERNATED):
         raise HTTPException(409, "Instance cannot be started in its current state")
@@ -149,6 +172,7 @@ async def start(instance_id: UUID, user: CurrentUser, database: Database) -> Acc
 @router.post("/{instance_id}/retry", response_model=AcceptedOut, status_code=202)
 async def retry(instance_id: UUID, user: CurrentUser, database: Database) -> AcceptedOut:
     item = await owned(database, user.id, instance_id)
+    await reject_active_ami_capture(instance_id, database)
     if item.status not in [InstanceStatus.ERROR, InstanceStatus.UNKNOWN]:
         raise HTTPException(409, "Only a failed launch can be retried")
     if await database.operations.find_one(
@@ -213,7 +237,8 @@ async def replace_ssh_key(
     await node_jobs.remote_exec(
         item,
         "install -d -m 700 ~/.ssh && touch ~/.ssh/authorized_keys && "
-        f"grep -qxF {quoted} ~/.ssh/authorized_keys || printf '%s\\n' {quoted} >> ~/.ssh/authorized_keys; "
+        f"grep -qxF {quoted} ~/.ssh/authorized_keys || "
+        f"printf '%s\\n' {quoted} >> ~/.ssh/authorized_keys; "
         "chmod 600 ~/.ssh/authorized_keys",
     )
     token = opaque_token()
@@ -237,6 +262,7 @@ async def replace_ssh_key(
 @router.post("/{instance_id}/stop", response_model=AcceptedOut, status_code=202)
 async def stop(instance_id: UUID, user: CurrentUser, database: Database) -> AcceptedOut:
     item = await owned(database, user.id, instance_id)
+    await reject_active_ami_capture(instance_id, database)
     scheduler.require_distributed(item)
     if item.status != InstanceStatus.RUNNING:
         raise HTTPException(409, "Instance is not running")
@@ -246,6 +272,7 @@ async def stop(instance_id: UUID, user: CurrentUser, database: Database) -> Acce
 @router.post("/{instance_id}/hibernate", response_model=AcceptedOut, status_code=202)
 async def hibernate(instance_id: UUID, user: CurrentUser, database: Database) -> AcceptedOut:
     item = await owned(database, user.id, instance_id)
+    await reject_active_ami_capture(instance_id, database)
     scheduler.require_distributed(item)
     if item.status != InstanceStatus.RUNNING:
         raise HTTPException(409, "Only a running instance can be hibernated")
@@ -255,6 +282,7 @@ async def hibernate(instance_id: UUID, user: CurrentUser, database: Database) ->
 @router.delete("/{instance_id}", response_model=AcceptedOut, status_code=202)
 async def terminate(instance_id: UUID, user: CurrentUser, database: Database) -> AcceptedOut:
     item = await owned(database, user.id, instance_id)
+    await reject_active_ami_capture(instance_id, database)
     scheduler.require_distributed(item)
     return await enqueue(database, user.id, item, OperationType.TERMINATE)
 

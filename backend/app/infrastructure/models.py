@@ -40,10 +40,13 @@ class OperationType(enum.StrEnum):
     SCALE_OUT = "SCALE_OUT"
     SCALE_IN = "SCALE_IN"
     RECONCILE = "RECONCILE"
+    PUBLISH_ENDPOINT = "PUBLISH_ENDPOINT"
 
 
 class AmiStatus(enum.StrEnum):
+    CREATING = "CREATING"
     AVAILABLE = "AVAILABLE"
+    FAILED = "FAILED"
 
 
 class NodeStatus(enum.StrEnum):
@@ -85,6 +88,8 @@ class User(StoredModel):
     is_active: bool = True
     is_platform_admin: bool = False
     platform_roles: list[PlatformRole] = Field(default_factory=list)
+    can_view_agent_code: bool = False
+    can_edit_agent_code: bool = False
     must_change_password: bool = False
     updated_at: datetime = Field(default_factory=now)
 
@@ -104,6 +109,11 @@ class Instance(StoredModel):
     description: str = ""
     status: InstanceStatus = InstanceStatus.PROVISIONING
     ipv4_address: str | None = None
+    tailscale_ipv4_address: str | None = None
+    tailscale_dns_name: str | None = None
+    public_endpoint: str | None = None
+    public_endpoint_status: Literal["DISABLED", "CONFIGURING", "ACTIVE", "ERROR"] = "DISABLED"
+    public_hostname: str | None = None
     cpu_count: int
     memory_mb: int
     disk_gb: int
@@ -116,6 +126,7 @@ class Instance(StoredModel):
     key_pair_id: UUID | None = None
     security_group_ids: list[UUID] = Field(default_factory=list)
     autoscaling_group_id: UUID | None = None
+    system_role: Literal["customer", "load_balancer"] = "customer"
     node_id: UUID | None = None
     availability_zone: str = "legacy-unassigned"
     provider_name: ComputeProvider = ComputeProvider.VAGRANT_LIBVIRT
@@ -134,6 +145,7 @@ class CloudNode(StoredModel):
     approved: bool = False
     schedulable: bool = True
     agent_token_hash: str
+    pending_agent_token_hash: str | None = None
     agent_version: str | None = None
     hostname: str | None = None
     management_address: str | None = None
@@ -203,6 +215,9 @@ class LaunchTemplate(StoredModel):
     cpu_count: int
     memory_mb: int
     disk_gb: int
+    instance_type: str = "custom"
+    availability_zones: list[str] = Field(default_factory=list)
+    security_group_ids: list[UUID] = Field(default_factory=list)
     user_data: str = ""
     key_pair_id: UUID | None = None
     create_key_pair: bool = False
@@ -229,12 +244,33 @@ class AutoScalingGroup(StoredModel):
 class LoadBalancer(StoredModel):
     user_id: UUID
     name: str
-    autoscaling_group_id: UUID
-    algorithm: Literal["round_robin", "least_connections"] = "round_robin"
+    target_group_id: UUID | None = None
+    # Kept temporarily so existing database rows remain readable during migration.
+    autoscaling_group_id: UUID | None = None
+    appliance_instance_id: UUID | None = None
+    algorithm: Literal[
+        "round_robin", "least_connections", "least_cpu", "random", "source_ip_hash"
+    ] = "round_robin"
     target_port: int = 80
     health_check_path: str = "/"
     health_check_interval_seconds: int = 10
     enabled: bool = True
+    public_endpoint: str | None = None
+    public_endpoint_status: Literal["DISABLED", "CONFIGURING", "ACTIVE", "ERROR"] = "DISABLED"
+    updated_at: datetime = Field(default_factory=now)
+
+
+class TargetGroup(StoredModel):
+    user_id: UUID
+    name: str
+    protocol: Literal["HTTP"] = "HTTP"
+    port: int = 80
+    target_type: Literal["instance"] = "instance"
+    registration_type: Literal["manual", "autoscaling"] = "manual"
+    instance_ids: list[UUID] = Field(default_factory=list)
+    autoscaling_group_id: UUID | None = None
+    health_check_path: str = "/"
+    health_check_interval_seconds: int = 10
     updated_at: datetime = Field(default_factory=now)
 
 
@@ -285,8 +321,14 @@ class Volume(StoredModel):
     user_id: UUID
     name: str
     size_gb: int
+    availability_zone: str = "regional"
     host_path: str
+    storage_backend: str = "control-plane-network"
+    node_id: UUID | None = None
+    origin_node_id: UUID | None = None
+    last_node_id: UUID | None = None
     attached_instance_id: UUID | None = None
+    device_name: str | None = None
     mount_path: str | None = None
     updated_at: datetime = Field(default_factory=now)
 
@@ -298,7 +340,7 @@ class Ami(StoredModel):
     source_instance_id: UUID
     node_id: UUID | None = None
     backing_instance_name: str
-    status: AmiStatus = AmiStatus.AVAILABLE
+    status: AmiStatus = AmiStatus.CREATING
     image: str
     cpu_count: int
     memory_mb: int

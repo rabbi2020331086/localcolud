@@ -1,17 +1,20 @@
 import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Activity, AlertTriangle, Boxes, Check, ChevronRight, CloudCog,
-  Copy, Database, Gauge, KeyRound, LogOut,
-  Network, Pause, Play, Plus, RefreshCw, Server, ShieldCheck, Trash2, Users, Workflow,
+  Activity, AlertTriangle, Bot, Boxes, ChevronRight, CloudCog,
+  Copy, Database, Gauge, HardDrive, KeyRound, LogOut,
+  Network, Pause, Play, Plus, RefreshCw, Server, ShieldCheck, Snowflake,
+  StopCircle, Stethoscope, Trash2, Users, Workflow,
 } from "lucide-react";
 import { api, apiBaseUrl, errorMessage } from "./api";
+import { AgentPage } from "./AgentPage";
+import { NodeDetails } from "./NodeDetails";
 import type {
-  AdminOperation, CloudNode, Enrollment, Overview, PlatformRole, TeamMember,
-  User, Workload,
+  AdminOperation, AdminVolume, CloudNode, Enrollment, InstanceDiagnostics,
+  NodeContribution, Overview, PlatformRole, TeamMember, User, Workload,
 } from "./types";
 
-type Page = "overview" | "nodes" | "workloads" | "operations" | "access";
+type Page = "overview" | "nodes" | "workloads" | "storage" | "operations" | "agent" | "access";
 const roleOptions: { value: PlatformRole; label: string; detail: string }[] = [
   { value: "ADMINISTRATOR", label: "Administrator", detail: "Unrestricted platform and access control" },
   { value: "OPERATIONS", label: "Manager / Operations", detail: "Infrastructure health and daily operations" },
@@ -75,7 +78,12 @@ function OverviewPage() {
 }
 
 function Metric({ icon, label, value, detail, tone }: { icon: ReactNode; label: string; value: ReactNode; detail: string; tone: string }) { return <article className="metric"><div className={`metric-icon ${tone}`}>{icon}</div><div><span>{label}</span><strong>{value}</strong><small>{detail}</small></div></article>; }
-function PageHeading({ eyebrow, title, detail, action }: { eyebrow: string; title: string; detail: string; action?: ReactNode }) { return <header className="page-heading"><div><span>{eyebrow}</span><h1>{title}</h1><p>{detail}</p></div>{action}</header>; }
+function PageHeading({ eyebrow, title, detail, action }: { eyebrow: string; title: string; detail: string; action?: ReactNode }) {
+  const qc = useQueryClient();
+  const workloads = qc.getQueryData<Workload[]>(["admin-workloads"]) ?? [];
+  const nodes = [...new Set(workloads.map(item => item.node ?? "Unassigned"))].sort();
+  return <header className="page-heading"><div><span>{eyebrow}</span><h1>{title}</h1><p>{detail}</p></div><div className="workload-filters">{title === "Workload inventory" && <select className="filter" defaultValue="ALL" onChange={event => window.dispatchEvent(new CustomEvent("localec2-node-filter", { detail: event.target.value }))}><option value="ALL">All nodes</option>{nodes.map(node => <option key={node}>{node}</option>)}</select>}{action}</div></header>;
+}
 function Panel({ title, subtitle, children }: { title: string; subtitle: string; children: ReactNode }) { return <section className="panel"><div className="panel-head"><div><h2>{title}</h2><p>{subtitle}</p></div></div>{children}</section>; }
 
 function NodeSetup({ enrollment, close }: { enrollment: Enrollment; close: () => void }) {
@@ -107,12 +115,16 @@ function ReservationPolicy({ node, save }: { node: CloudNode; save: (values: Rec
   </form>;
 }
 
-function NodesPage() {
+function NodesPage({ token }: { token: string }) {
   const qc = useQueryClient();
   const [error, setError] = useState("");
   const [showEnroll, setShowEnroll] = useState(false);
   const [enrollment, setEnrollment] = useState<Enrollment | null>(null);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [agentUrls, setAgentUrls] = useState<Record<string, string>>({});
+  const [updatingAgent, setUpdatingAgent] = useState("");
   const nodes = useQuery({ queryKey: ["admin-nodes"], queryFn: () => api.get<CloudNode[]>("/nodes").then(r => r.data), refetchInterval: 10000 });
+  const contributions = useQuery({ queryKey: ["node-contributions"], queryFn: () => api.get<NodeContribution[]>("/admin/node-contributions").then(r => r.data), refetchInterval: 10000 });
   const update = async (id: string, values: Record<string, unknown>) => {
     try { await api.patch(`/nodes/${id}`, values); await qc.invalidateQueries({ queryKey: ["admin-nodes"] }); }
     catch (value) { setError(errorMessage(value)); }
@@ -129,7 +141,41 @@ function NodesPage() {
       await qc.invalidateQueries({ queryKey: ["admin-nodes"] });
     } catch (value) { setError(errorMessage(value)); }
   };
+  const forceRemoveNode = async (node: CloudNode) => {
+    if (!confirm(`FORCE REMOVE ${node.name}? All assigned instances and active jobs will be removed. Unsynchronized volume data may be lost.`)) return;
+    if (!confirm(`Final confirmation: permanently remove ${node.name} from the control plane?`)) return;
+    try {
+      const { data } = await api.post<{ warning: string }>(`/admin/nodes/${node.id}/force-remove`);
+      setError(data.warning);
+      if (selectedNodeId === node.id) setSelectedNodeId(null);
+      await qc.invalidateQueries({ queryKey: ["admin-nodes"] });
+      await qc.invalidateQueries({ queryKey: ["node-contributions"] });
+      await qc.invalidateQueries({ queryKey: ["admin-workloads"] });
+      await qc.invalidateQueries({ queryKey: ["admin-volumes"] });
+      await qc.invalidateQueries({ queryKey: ["admin-operations"] });
+    } catch (value) { setError(errorMessage(value)); }
+  };
+  const removeNode = async (node: CloudNode) => {
+    if (!confirm(`Remove ${node.name}?`)) return;
+    try {
+      await api.delete(`/nodes/${node.id}`);
+      setSelectedNodeId(null);
+      await qc.invalidateQueries({ queryKey: ["admin-nodes"] });
+    } catch (value) { setError(errorMessage(value)); }
+  };
+  const updateAgent = async (node: CloudNode) => {
+    const controlPlane = (agentUrls[node.id] ?? apiBaseUrl).trim().replace(/\/$/, "");
+    setUpdatingAgent(node.id); setError("");
+    try {
+      const { data } = await api.post<{ version: string; message: string }>(`/admin/nodes/${node.id}/update-agent`, { control_plane_url: controlPlane });
+      setError(`${data.message}. ${node.name} will reconnect as agent ${data.version}.`);
+      window.setTimeout(() => { void qc.invalidateQueries({ queryKey: ["admin-nodes"] }); }, 15000);
+    } catch (value) { setError(errorMessage(value)); }
+    finally { setUpdatingAgent(""); }
+  };
   const list = nodes.data ?? [];
+  const selectedNode = list.find(node => node.id === selectedNodeId);
+  if (selectedNode) return <>{error && <Notice>{error}</Notice>}{enrollment && <NodeSetup enrollment={enrollment} close={() => setEnrollment(null)} />}<NodeDetails node={selectedNode} contribution={contributions.data?.find(item => item.node_id === selectedNode.id)} token={token} agentUrl={agentUrls[selectedNode.id] ?? apiBaseUrl} updating={updatingAgent === selectedNode.id} reservationPolicy={<ReservationPolicy node={selectedNode} save={values => update(selectedNode.id, values)} />} onBack={() => setSelectedNodeId(null)} onAgentUrl={value => setAgentUrls(current => ({ ...current, [selectedNode.id]: value }))} onUpdateAgent={() => void updateAgent(selectedNode)} onSetup={() => void prepareSetup(selectedNode)} onApprove={() => void update(selectedNode.id, { approved: true })} onToggleScheduling={() => void update(selectedNode.id, { schedulable: !selectedNode.schedulable })} onRemove={() => void removeNode(selectedNode)} onForceRemove={() => void forceRemoveNode(selectedNode)} /></>;
   return <>
     <PageHeading eyebrow="INFRASTRUCTURE" title="Compute nodes" detail="Connect real Ubuntu hosts, approve scheduling, and inspect reported capacity and networking." action={<button className="primary" onClick={() => setShowEnroll(x => !x)}><Plus />Enroll node</button>} />
     {error && <Notice>{error}</Notice>}
@@ -137,23 +183,32 @@ function NodesPage() {
     {showEnroll && <Panel title="New infrastructure identity" subtitle="After enrollment, run the generated installer on the dedicated Ubuntu host."><form className="inline-form" onSubmit={enroll}><label>Node name<input name="name" placeholder="compute-01" required /></label><label>Logical zone<input name="availability_zone" defaultValue="local-region-1a" required /></label><label>Provider<select name="provider_name"><option value="vagrant-libvirt">Vagrant + libvirt/KVM</option></select></label><button className="primary">Continue to installation</button></form></Panel>}
     <div className="node-grid">{list.map(node => {
       const computeReady = ["jobs", "vagrant", "libvirt", "kvm"].every(capability => node.capabilities.includes(capability));
+      const contribution = contributions.data?.find(item => item.node_id === node.id);
       return <article className="node-card" key={node.id}>
-      <header><div className="node-icon"><Server /></div><div><h3>{node.name}</h3><span>{node.hostname ?? "Agent not installed"}</span></div><Status value={node.status} /></header>
-      {(!node.last_seen_at || !computeReady) && <div className="agent-missing"><AlertTriangle /><span><strong>{node.last_seen_at ? "Compute agent upgrade required" : "No host inventory received"}</strong><small>{node.last_seen_at ? "Install the current agent before this host can run VM jobs." : "Run the node installer to report real resources and networking."}</small></span><button onClick={() => void prepareSetup(node)}>Setup / reconnect</button></div>}
+      <header><div className="node-icon"><Server /></div><div><h3>{node.name}</h3><span>{node.hostname ?? "Agent not installed"}</span></div><div className="node-card-header-actions"><Status value={node.status} /><button onClick={() => setSelectedNodeId(node.id)}>View details<ChevronRight /></button></div></header>
+      {(!node.last_seen_at || !computeReady) && <div className="agent-missing"><AlertTriangle /><span><strong>{node.last_seen_at ? "Compute agent upgrade required" : "No host inventory received"}</strong><small>{node.last_seen_at ? "Open node details to update its agent." : "Open node details for setup instructions."}</small></span></div>}
       <dl><div><dt>Placement</dt><dd>{node.availability_zone}</dd></div><div><dt>Provider</dt><dd>{node.provider_name}</dd></div><div><dt>Management address</dt><dd>{node.management_address ?? "Waiting for agent"}</dd></div><div><dt>Last heartbeat</dt><dd>{node.last_seen_at ? new Date(node.last_seen_at).toLocaleString() : "Never"}</dd></div></dl>
       <div className="network-summary"><Network /><span><strong>{node.virtual_networks.length ? `libvirt: ${node.virtual_networks.join(", ")}` : "Virtual network not reported"}</strong><small>{node.network_interfaces.length ? node.network_interfaces.filter(item => item.family === "IPv4").slice(0, 4).map(item => `${item.name} ${item.address}`).join(" · ") || "No IPv4 address reported" : "Interfaces appear after agent connection"}</small></span></div>
       <div className="capability-list">{node.capabilities.length ? node.capabilities.map(item => <span key={item}>{item}</span>) : <span className="muted">Awaiting capability check</span>}</div>
-      {node.last_seen_at && <ReservationPolicy node={node} save={values => update(node.id, values)} />}
       <div className="node-capacity"><CapacityBar label="CPU allocatable" used={node.cpu_allocated} total={Math.max(0, node.cpu_total - node.cpu_reserved)} unit="vCPU" /><CapacityBar label="Memory allocatable" used={Math.round(node.memory_allocated_mb / 1024)} total={Math.max(0, Math.round((node.memory_total_mb - node.memory_reserved_mb) / 1024))} unit="GB" /><CapacityBar label="Storage allocatable" used={node.storage_allocated_gb} total={Math.max(0, node.storage_total_gb - node.storage_reserved_gb)} unit="GB" /></div>
-      <footer>{(!node.last_seen_at || !computeReady) && <button onClick={() => void prepareSetup(node)}><RefreshCw />Install agent</button>}{!node.approved ? <button className="approve" disabled={!node.last_seen_at || !computeReady} title={!computeReady ? "Install a job-capable agent before approval" : !node.last_seen_at ? "Connect the node before approval" : "Approve for scheduling"} onClick={() => void update(node.id, { approved: true })}><Check />Approve</button> : node.schedulable ? <button onClick={() => void update(node.id, { schedulable: false })}><Pause />Drain</button> : <button disabled={!computeReady} onClick={() => void update(node.id, { schedulable: true })}><Play />Enable</button>}<button className="danger" onClick={async () => { if (!confirm(`Remove ${node.name}?`)) return; try { await api.delete(`/nodes/${node.id}`); await qc.invalidateQueries({ queryKey: ["admin-nodes"] }); } catch (value) { setError(errorMessage(value)); } }}><Trash2 />Remove</button></footer>
+      {contribution && <div className="capacity"><span>Instances <strong>{contribution.instances}</strong></span><span>Attached volumes <strong>{contribution.attached_volumes}</strong><small>{contribution.attached_volume_gb} GB</small></span><span>Originated volumes <strong>{contribution.originated_volumes}</strong></span></div>}
     </article>})}{!list.length && <Panel title="No infrastructure registered" subtitle="Enroll a dedicated host to start building capacity."><Empty title="Your node fleet is empty" detail="The installer will register real host resources here." /></Panel>}</div>
   </>;
 }
 
 function WorkloadsPage() {
-  const [filter, setFilter] = useState("ALL"); const workloads = useQuery({ queryKey: ["admin-workloads"], queryFn: () => api.get<Workload[]>("/admin/instances").then(r => r.data), refetchInterval: 10000 });
-  const rows = (workloads.data ?? []).filter(x => filter === "ALL" || x.status === filter);
-  return <><PageHeading eyebrow="CUSTOMER COMPUTE" title="Workload inventory" detail="Read-only visibility into instances across every customer account." action={<select className="filter" value={filter} onChange={e => setFilter(e.target.value)}><option>ALL</option><option>RUNNING</option><option>STOPPED</option><option>ERROR</option></select>} /><Panel title="All instances" subtitle={`${rows.length} workloads match the current view`}><div className="table-wrap"><table><thead><tr><th>Instance</th><th>Owner</th><th>Status</th><th>Placement</th><th>Resources</th><th>Address</th></tr></thead><tbody>{rows.map(row => <tr key={row.id}><td><strong>{row.name}</strong><small>{row.provider}</small></td><td>{row.owner}</td><td><Status value={row.status} /></td><td>{row.node ?? "Unassigned"}<small>{row.zone ?? "Legacy local provider"}</small></td><td>{row.cpu_count} vCPU · {(row.memory_mb / 1024).toFixed(1)} GB<small>{row.disk_gb} GB root disk</small></td><td><code>{row.ipv4_address ?? "—"}</code></td></tr>)}</tbody></table>{!rows.length && <Empty title="No workloads" detail="Customer instances will appear here." />}</div></Panel></>;
+  const qc = useQueryClient(); const [filter, setFilter] = useState("ALL"); const [nodeFilter, setNodeFilter] = useState("ALL"); const [selected, setSelected] = useState<string | null>(null); const [error, setError] = useState(""); const workloads = useQuery({ queryKey: ["admin-workloads"], queryFn: () => api.get<Workload[]>("/admin/instances").then(r => r.data), refetchInterval: 10000 });
+  const diagnostics = useQuery({ queryKey: ["admin-diagnostics", selected], queryFn: () => api.get<InstanceDiagnostics>(`/admin/instances/${selected}/diagnostics`).then(r => r.data), enabled: Boolean(selected), retry: false });
+  useEffect(() => { const listener = (event: Event) => setNodeFilter((event as CustomEvent<string>).detail); window.addEventListener("localec2-node-filter", listener); return () => window.removeEventListener("localec2-node-filter", listener); }, []);
+  const rows = (workloads.data ?? []).filter(x => (filter === "ALL" || x.status === filter) && (nodeFilter === "ALL" || (x.node ?? "Unassigned") === nodeFilter)).sort((a, b) => (a.node ?? "~").localeCompare(b.node ?? "~") || a.name.localeCompare(b.name));
+  const control = async (row: Workload, action: string) => { if (action === "terminate" && !confirm(`Terminate ${row.name}?`)) return; const path = action === "terminate" && confirm("Force removal? Choose Cancel for a normal graceful termination.") ? "force/remove" : action; try { await api.post(`/admin/instances/${row.id}/${path}`); setError(""); await qc.invalidateQueries({ queryKey: ["admin-workloads"] }); await qc.invalidateQueries({ queryKey: ["admin-operations"] }); } catch (value) { setError(errorMessage(value)); } };
+  return <><PageHeading eyebrow="CUSTOMER COMPUTE" title="Workload inventory" detail="Physical placement, diagnostics, and emergency controls across every customer account." action={<select className="filter" value={filter} onChange={e => setFilter(e.target.value)}><option>ALL</option><option>RUNNING</option><option>STOPPED</option><option>ERROR</option><option>UNKNOWN</option></select>} />{error && <Notice>{error}</Notice>}<Panel title="All instances" subtitle={`${rows.length} workloads match the current view`}><div className="table-wrap"><table><thead><tr><th>Instance</th><th>Owner</th><th>Status</th><th>Physical placement</th><th>Resources</th><th>Address</th><th>Diagnostics & control</th></tr></thead><tbody>{rows.map(row => <tr key={row.id}><td><strong>{row.name}</strong><small>{row.instance_type} · {row.provider}</small>{row.last_error && <small>{row.last_error}</small>}</td><td>{row.owner}</td><td><Status value={row.status} /></td><td><strong>{row.node ?? "Unassigned"}</strong><small>{row.zone ?? "Legacy local provider"}</small></td><td>{row.cpu_count} vCPU · {(row.memory_mb / 1024).toFixed(1)} GB<small>{row.disk_gb} GB root disk</small></td><td><code>{row.ipv4_address ?? "—"}</code></td><td><div className="row-actions"><button title="Run diagnostics" onClick={() => setSelected(selected === row.id ? null : row.id)}><Stethoscope /></button>{row.status === "RUNNING" && <><button title="Stop" onClick={() => void control(row, "stop")}><StopCircle /></button><button title="Hibernate" onClick={() => void control(row, "hibernate")}><Snowflake /></button></>}{["STOPPED","HIBERNATED"].includes(row.status) && <button title="Start" onClick={() => void control(row, "start")}><Play /></button>}<button className="danger" title="Terminate" onClick={() => void control(row, "terminate")}><Trash2 /></button></div></td></tr>)}</tbody></table>{!rows.length && <Empty title="No workloads" detail="Customer instances will appear here." />}</div></Panel>{selected && <Panel title="Instance diagnostics" subtitle={diagnostics.isFetching ? "Querying the assigned compute agent…" : diagnostics.error ? errorMessage(diagnostics.error) : "Live provider state, guest metrics, and recent node jobs"}>{diagnostics.data && <><div className="metric-grid"><Metric icon={<Server />} label="Provider state" value={diagnostics.data.inspect.state} detail={diagnostics.data.inspect.ipv4_address ?? "No guest address"} tone="blue" /><Metric icon={<Activity />} label="Guest CPU" value={diagnostics.data.metrics ? `${diagnostics.data.metrics.cpu_percent.toFixed(1)}%` : "—"} detail="Live guest sample" tone="green" /><Metric icon={<Database />} label="Guest memory" value={diagnostics.data.metrics ? `${diagnostics.data.metrics.memory_percent.toFixed(1)}%` : "—"} detail={`Root disk ${diagnostics.data.metrics?.root_disk_percent ?? "—"}`} tone="violet" /></div><div className="table-wrap"><table><thead><tr><th>Job</th><th>Status</th><th>Error</th><th>Created</th></tr></thead><tbody>{diagnostics.data.recent_jobs.map(job => <tr key={job.id}><td>{job.type}</td><td><Status value={job.status} /></td><td>{job.error ?? "—"}</td><td>{new Date(job.created_at).toLocaleString()}</td></tr>)}</tbody></table></div></>}</Panel>}</>;
+}
+
+function StoragePage() {
+  const qc = useQueryClient(); const [error, setError] = useState(""); const volumes = useQuery({ queryKey: ["admin-volumes"], queryFn: () => api.get<AdminVolume[]>("/admin/volumes").then(r => r.data), refetchInterval: 10000 });
+  const refresh = () => { void qc.invalidateQueries({ queryKey: ["admin-volumes"] }); void qc.invalidateQueries({ queryKey: ["node-contributions"] }); };
+  return <><PageHeading eyebrow="DISTRIBUTED STORAGE" title="Volume inventory" detail="Cross-tenant backing ownership, node synchronization history, placement, and administrative controls." />{error && <Notice>{error}</Notice>}<Panel title="All volumes" subtitle={`${volumes.data?.length ?? 0} customer volumes`}><div className="table-wrap"><table><thead><tr><th>Volume</th><th>Owner</th><th>Scope</th><th>Origin / synchronization</th><th>Attachment</th><th>Backing</th><th>Control</th></tr></thead><tbody>{volumes.data?.map(volume => <tr key={volume.id}><td><strong>{volume.name}</strong><small>{volume.size_gb} GB · {volume.storage_backend}</small></td><td>{volume.owner}</td><td>{volume.availability_zone === "regional" ? "Regional shared" : volume.availability_zone}</td><td><strong>{volume.origin_node ?? "Not materialized"}</strong><small>Last node: {volume.last_node ?? "—"}</small></td><td>{volume.attached_instance ?? "Available"}<small>{volume.current_node ?? "No current node"} {volume.device_name ? `· ${volume.device_name}` : ""} {volume.mount_path ?? ""}</small></td><td><Status value={volume.canonical_present ? "AVAILABLE" : volume.attached_instance ? "RUNNING" : "PENDING"} /></td><td><div className="row-actions">{volume.attached_instance_id && <button title="Detach and synchronize" onClick={async () => { try { await api.post(`/admin/volumes/${volume.id}/detach`); refresh(); } catch (value) { setError(errorMessage(value)); } }}><Pause /></button>}<button className="danger" disabled={Boolean(volume.attached_instance_id)} title="Delete volume" onClick={async () => { if (!confirm(`Delete ${volume.name}?`)) return; try { await api.delete(`/admin/volumes/${volume.id}`); refresh(); } catch (value) { setError(errorMessage(value)); } }}><Trash2 /></button></div></td></tr>)}</tbody></table>{!volumes.data?.length && <Empty title="No volumes" detail="Customer volume creation will appear here with physical synchronization history." />}</div></Panel></>;
 }
 
 function OperationsTable({ rows }: { rows: AdminOperation[] }) { return <div className="table-wrap"><table><thead><tr><th>Operation</th><th>Owner</th><th>Status</th><th>Progress</th><th>Message</th><th>Time</th></tr></thead><tbody>{rows.map(row => <tr key={row.id}><td><strong>{row.type}</strong></td><td>{row.owner}</td><td><Status value={row.status} /></td><td><progress value={row.progress} max="100" /><small>{row.progress}%</small></td><td>{row.error_message ?? row.message}</td><td>{new Date(row.created_at).toLocaleString()}</td></tr>)}</tbody></table>{!rows.length && <Empty title="No operations" detail="Platform activity will appear here." />}</div>; }
@@ -162,20 +217,25 @@ function OperationsPage() { const operations = useQuery({ queryKey: ["admin-oper
 function AccessPage() {
   const qc = useQueryClient(); const [error, setError] = useState(""); const [showAdd, setShowAdd] = useState(false);
   const team = useQuery({ queryKey: ["admin-team"], queryFn: () => api.get<TeamMember[]>("/admin/team").then(r => r.data) });
-  const toggle = async (member: TeamMember, role: PlatformRole) => { const selected = member.platform_roles.includes(role) ? member.platform_roles.filter(x => x !== role) : [...member.platform_roles, role]; try { await api.patch(`/admin/team/${member.id}`, { platform_roles: selected, is_active: member.is_active }); await qc.invalidateQueries({ queryKey: ["admin-team"] }); } catch (value) { setError(errorMessage(value)); } };
+  const toggle = async (member: TeamMember, role: PlatformRole) => { const selected = member.platform_roles.includes(role) ? member.platform_roles.filter(x => x !== role) : [...member.platform_roles, role]; try { await api.patch(`/admin/team/${member.id}`, { platform_roles: selected, is_active: member.is_active, can_view_agent_code: member.can_view_agent_code, can_edit_agent_code: member.can_edit_agent_code }); await qc.invalidateQueries({ queryKey: ["admin-team"] }); } catch (value) { setError(errorMessage(value)); } };
   const add = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const form = new FormData(event.currentTarget); try { await api.post("/admin/team", { email: form.get("email"), display_name: form.get("display_name"), temporary_password: form.get("temporary_password"), platform_roles: [form.get("role")] }); setShowAdd(false); await qc.invalidateQueries({ queryKey: ["admin-team"] }); } catch (value) { setError(errorMessage(value)); } };
   return <><PageHeading eyebrow="IDENTITY & GOVERNANCE" title="Team access" detail="Invite platform staff and assign the minimum permissions they require." action={<button className="primary" onClick={() => setShowAdd(x => !x)}><Plus />Add team member</button>} />{error && <Notice>{error}</Notice>}{team.error && <Notice>Could not load the platform team: {errorMessage(team.error)}</Notice>}{showAdd && <Panel title="Create platform identity" subtitle="The member must change this temporary password on first sign-in."><form className="inline-form member" onSubmit={add}><label>Name<input name="display_name" required /></label><label>Email<input name="email" type="email" required /></label><label>Temporary password<input name="temporary_password" type="password" minLength={10} required /></label><label>Initial role<select name="role">{roleOptions.map(role => <option value={role.value} key={role.value}>{role.label}</option>)}</select></label><button className="primary">Create member</button></form></Panel>}<div className="access-layout"><Panel title="Platform team" subtitle={team.isLoading ? "Loading identities…" : `${team.data?.length ?? 0} identities`}><div className="member-list">{(team.data ?? []).map(member => <article key={member.id}><div className="avatar">{member.display_name.slice(0, 2).toUpperCase()}</div><div className="member-main"><h3>{member.display_name}</h3><p>{member.email}</p><div className="role-pills">{member.platform_roles.length ? member.platform_roles.map(role => <span key={role}>{roleOptions.find(x => x.value === role)?.label ?? role}</span>) : <em>Customer only</em>}</div></div><Status value={member.is_active ? "ACTIVE" : "DISABLED"} /><div className="role-menu">{roleOptions.map(role => <label title={role.detail} key={role.value}><input type="checkbox" checked={member.platform_roles.includes(role.value)} onChange={() => void toggle(member, role.value)} /><span><strong>{role.label}</strong><small>{role.detail}</small></span></label>)}</div></article>)}</div></Panel><Panel title="Role policy" subtitle="Default access boundaries"><div className="policy-list">{roleOptions.map(role => <div key={role.value}><ShieldCheck /><span><strong>{role.label}</strong><small>{role.detail}</small></span></div>)}</div></Panel></div></>;
 }
 
-function Shell({ user, logout }: { user: User; logout: () => void }) {
+function Shell({ user, token, logout }: { user: User; token: string; logout: () => void }) {
   const [page, setPage] = useState<Page>("overview"); const qc = useQueryClient(); const isAdmin = hasRole(user, "ADMINISTRATOR"); const canOperate = isAdmin || hasRole(user, "OPERATIONS");
-  const nav = useMemo(() => canOperate ? [
+  const canViewAgent = isAdmin || user.can_view_agent_code || user.can_edit_agent_code;
+  const nav = useMemo(() => [
+    ...(canOperate ? [
     ["overview", Gauge, "Overview"], ["nodes", Server, "Infrastructure"],
-    ["workloads", Boxes, "Workloads"], ["operations", Activity, "Operations"],
+    ["workloads", Boxes, "Workloads"], ["storage", HardDrive, "Storage"],
+    ["operations", Activity, "Operations"],
     ...(isAdmin ? [["access", Users, "Team & access"]] : []),
-  ] as [Page, typeof Gauge, string][] : [], [canOperate, isAdmin]);
-  const content = !canOperate ? <div className="restricted"><ShieldCheck /><h1>Role workspace not available yet</h1><p>Your role is active, but its specialized module has not been enabled.</p></div> : page === "overview" ? <OverviewPage /> : page === "nodes" ? <NodesPage /> : page === "workloads" ? <WorkloadsPage /> : page === "operations" ? <OperationsPage /> : <AccessPage />;
-  return <div className="shell"><aside><div className="brand"><div><CloudCog /></div><span>LocalEC2<small>CONTROL PLANE</small></span></div><div className="nav-label">PLATFORM</div><nav>{nav.map(([id, Icon, label]) => <button className={page === id ? "active" : ""} onClick={() => setPage(id)} key={id}><Icon />{label}</button>)}</nav><div className="side-health"><span><i />Management API</span><strong>Connected</strong></div><div className="identity"><div className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</div><span><strong>{user.display_name}</strong><small>{isAdmin ? "Platform administrator" : "Operations manager"}</small></span><button title="Sign out" onClick={logout}><LogOut /></button></div></aside><div className="workspace"><div className="topbar"><div><span className="breadcrumb">LocalEC2 / <strong>{nav.find(x => x[0] === page)?.[2] ?? "Restricted"}</strong></span></div><div><span className="utc">{new Date().toLocaleDateString(undefined, { dateStyle: "medium" })}</span><button title="Refresh data" onClick={() => void qc.invalidateQueries()}><RefreshCw /></button></div></div><main>{content}</main></div></div>;
+    ] : []),
+    ...(canViewAgent ? [["agent", Bot, "Agent"]] : []),
+  ] as [Page, typeof Gauge, string][], [canOperate, canViewAgent, isAdmin]);
+  const content = page === "agent" && canViewAgent ? <AgentPage user={user} /> : !canOperate ? <div className="restricted"><ShieldCheck /><h1>Role workspace not available yet</h1><p>Your role is active, but its specialized module has not been enabled.</p></div> : page === "overview" ? <OverviewPage /> : page === "nodes" ? <NodesPage token={token} /> : page === "workloads" ? <WorkloadsPage /> : page === "storage" ? <StoragePage /> : page === "operations" ? <OperationsPage /> : <AccessPage />;
+  return <div className="shell auto-sidebar"><aside><div className="brand"><div><CloudCog /></div><span>LocalEC2<small>CONTROL PLANE</small></span></div><div className="nav-label">PLATFORM</div><nav>{nav.map(([id, Icon, label]) => <button title={label} className={page === id ? "active" : ""} onClick={() => setPage(id)} key={id}><Icon /><span>{label}</span></button>)}</nav><div className="side-health"><span><i />Management API</span><strong>Connected</strong></div><div className="identity"><div className="avatar">{user.display_name.slice(0, 2).toUpperCase()}</div><span><strong>{user.display_name}</strong><small>{isAdmin ? "Platform administrator" : "Operations manager"}</small></span><button title="Sign out" onClick={logout}><LogOut /></button></div></aside><div className="workspace"><div className="topbar"><div><span className="breadcrumb">LocalEC2 / <strong>{nav.find(x => x[0] === page)?.[2] ?? "Restricted"}</strong></span></div><div><span className="utc">{new Date().toLocaleDateString(undefined, { dateStyle: "medium" })}</span><button title="Refresh data" onClick={() => void qc.invalidateQueries()}><RefreshCw /></button></div></div><main>{content}</main></div></div>;
 }
 
 export default function App() {
@@ -184,5 +244,5 @@ export default function App() {
   if (!ready) return <div className="loading full"><RefreshCw />Connecting to control plane…</div>;
   if (!session) return <Login onLogin={(token, user) => setSession({ token, user })} />;
   if (session.user.must_change_password) return <ChangePassword done={() => setSession({ ...session, user: { ...session.user, must_change_password: false } })} />;
-  return <Shell user={session.user} logout={() => { void api.post("/auth/logout"); delete api.defaults.headers.common.Authorization; setSession(null); }} />;
+  return <Shell user={session.user} token={session.token} logout={() => { void api.post("/auth/logout"); delete api.defaults.headers.common.Authorization; setSession(null); }} />;
 }

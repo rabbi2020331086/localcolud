@@ -11,9 +11,20 @@ from app.api.dependencies import has_platform_admin_access
 from app.api.routes.auth import refresh_cookie_name
 from app.api.routes.nodes import observed_status
 from app.core.security import create_jwt, decode_jwt, hash_password, verify_password
-from app.infrastructure.models import CloudNode, Instance, LoadBalancer, NodeStatus, User
+from app.infrastructure.models import (
+    CloudNode,
+    Instance,
+    InstanceStatus,
+    LoadBalancer,
+    NodeStatus,
+    TargetGroup,
+    User,
+)
 from app.infrastructure.vm import safe_name
+from app.schemas import InstanceCreate
 from app.services import load_balancing
+from app.services.autoscaling import capacity_instances
+from app.services.reconciliation import provider_status
 
 
 def test_password_hashing():
@@ -30,6 +41,13 @@ def test_jwt_roundtrip():
 def test_safe_name():
     value = safe_name("12345678-aaaa", "My Dev_VM!")
     assert value.startswith("localec2-12345678-my-dev-vm-") and " " not in value
+
+
+def test_instance_create_accepts_startup_user_data():
+    script = "#!/usr/bin/env bash\nset -e\necho ready\n"
+    request = InstanceCreate(name="web", user_data=script)
+
+    assert request.user_data == script
 
 
 def test_admin_and_customer_refresh_sessions_are_separate():
@@ -51,6 +69,8 @@ def test_node_agent_renders_libvirt_machine(tmp_path, monkeypatch):
             "memory_mb": 8192,
             "disk_gb": 25,
             "public_key": "ssh-ed25519 AAAATEST portfolio@example",
+            "_firmware_loader": "/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "_firmware_nvram": "/var/lib/localec2/instances/web-01/OVMF_VARS.fd",
         }
     )
 
@@ -59,7 +79,8 @@ def test_node_agent_renders_libvirt_machine(tmp_path, monkeypatch):
     assert 'config.vm.synced_folder ".", "/vagrant", disabled: true' in content
     assert 'provider.driver = "kvm"' in content
     assert 'provider.cpu_mode = "host-passthrough"' in content
-    assert 'provider.loader = "/usr/share/OVMF/OVMF_CODE.fd"' in content
+    assert 'provider.loader = "/usr/share/OVMF/OVMF_CODE_4M.fd"' in content
+    assert 'provider.nvram = "/var/lib/localec2/instances/web-01/OVMF_VARS.fd"' in content
     assert "provider.cpus = 4" in content
     assert "provider.memory = 8192" in content
     assert "provider.machine_virtual_size = 25" in content
@@ -105,6 +126,37 @@ def test_node_observed_status_uses_approval_drain_and_heartbeat_age():
 
     node.schedulable = False
     assert observed_status(node, now) == NodeStatus.DRAINING
+
+
+def test_libvirt_shutoff_maps_to_stopped():
+    assert provider_status("Shutoff") == InstanceStatus.STOPPED
+
+
+def test_autoscaling_error_instances_do_not_satisfy_desired_capacity():
+    user_id = uuid4()
+    instances = [
+        Instance(
+            user_id=user_id,
+            multipass_name=f"vm-{status.value.lower()}",
+            display_name=status.value,
+            cpu_count=1,
+            memory_mb=1024,
+            disk_gb=5,
+            image="24.04",
+            status=status,
+        )
+        for status in (
+            InstanceStatus.RUNNING,
+            InstanceStatus.PROVISIONING,
+            InstanceStatus.ERROR,
+            InstanceStatus.TERMINATING,
+        )
+    ]
+
+    assert [item.status for item in capacity_instances(instances)] == [
+        InstanceStatus.RUNNING,
+        InstanceStatus.PROVISIONING,
+    ]
 
 
 def test_platform_admin_is_an_explicit_role():
@@ -182,3 +234,44 @@ async def test_load_balancer_least_connections_avoids_busy_target():
 
     assert selected and selected.id == targets[1].id
     await load_balancing.release_target(lb.id, selected.id)
+
+
+def test_haproxy_configuration_uses_tailscale_targets_and_selected_policy():
+    user_id = uuid4()
+    lb = LoadBalancer(
+        user_id=user_id,
+        name="production",
+        target_group_id=uuid4(),
+        algorithm="least_connections",
+        target_port=8080,
+        health_check_path="/health",
+    )
+    target = Instance(
+        user_id=user_id,
+        multipass_name="vm-web",
+        display_name="web",
+        cpu_count=1,
+        memory_mb=1024,
+        disk_gb=5,
+        image="24.04",
+        tailscale_ipv4_address="100.64.0.10",
+    )
+
+    config = load_balancing.haproxy_configuration(lb, [target])
+
+    assert "balance leastconn" in config
+    assert "option httpchk GET /health" in config
+    assert "100.64.0.10:8080 check" in config
+
+
+def test_manual_target_group_keeps_explicit_instance_registration():
+    instance_ids = [uuid4(), uuid4()]
+    group = TargetGroup(
+        user_id=uuid4(),
+        name="manual-web",
+        registration_type="manual",
+        instance_ids=instance_ids,
+    )
+
+    assert group.instance_ids == instance_ids
+    assert group.autoscaling_group_id is None

@@ -40,6 +40,8 @@ class UserOut(OrmModel):
     is_platform_admin: bool
     platform_roles: list[PlatformRole]
     must_change_password: bool
+    can_view_agent_code: bool = False
+    can_edit_agent_code: bool = False
 
 
 class RegisterIn(BaseModel):
@@ -72,6 +74,8 @@ class PasswordChangeIn(BaseModel):
 class TeamMemberUpdate(BaseModel):
     platform_roles: list[PlatformRole] = Field(max_length=5)
     is_active: bool = True
+    can_view_agent_code: bool = False
+    can_edit_agent_code: bool = False
 
 
 class TeamMemberCreate(BaseModel):
@@ -95,6 +99,7 @@ class TokenOut(BaseModel):
 class InstanceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=40, pattern=r"^[A-Za-z0-9 _-]+$")
     description: str = Field(default="", max_length=500)
+    launch_template_id: UUID | None = None
     image: str = Field(default="24.04", max_length=50)
     ami_id: UUID | None = None
     cpu_count: int = Field(default=2, ge=1, le=8)
@@ -105,6 +110,7 @@ class InstanceCreate(BaseModel):
     key_pair_id: UUID | None = None
     security_group_ids: list[UUID] = Field(default_factory=list, max_length=5)
     availability_zone: str | None = Field(default=None, max_length=80, pattern=r"^[a-z0-9.-]+$")
+    user_data: str = Field(default="", max_length=20000)
 
     @model_validator(mode="after")
     def apply_instance_type(self) -> "InstanceCreate":
@@ -123,6 +129,13 @@ class InstanceCreate(BaseModel):
             raise ValueError("Control characters are not allowed")
         return value
 
+    @field_validator("user_data")
+    @classmethod
+    def valid_user_data(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("User data cannot contain null bytes")
+        return value
+
 
 class InstanceOut(OrmModel):
     id: UUID
@@ -130,6 +143,10 @@ class InstanceOut(OrmModel):
     description: str
     status: InstanceStatus
     ipv4_address: str | None
+    tailscale_ipv4_address: str | None
+    tailscale_dns_name: str | None
+    public_endpoint: str | None
+    public_endpoint_status: str
     cpu_count: int
     memory_mb: int
     disk_gb: int
@@ -212,6 +229,31 @@ class NodeUpdate(BaseModel):
         return None if value is None else NodeCreate.safe_labels(value)
 
 
+class HostCommandIn(BaseModel):
+    command: str = Field(min_length=1, max_length=20000)
+    timeout_seconds: int = Field(default=60, ge=1, le=600)
+    run_as_root: bool = False
+
+    @field_validator("command")
+    @classmethod
+    def no_null_bytes(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("Command cannot contain null bytes")
+        return value
+
+
+class AgentUpdateIn(BaseModel):
+    control_plane_url: str = Field(min_length=12, max_length=500)
+
+    @field_validator("control_plane_url")
+    @classmethod
+    def valid_control_plane_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        if not re.fullmatch(r"https?://[^\s#]+/api/v1", normalized):
+            raise ValueError("Control-plane URL must look like https://host/api/v1")
+        return normalized
+
+
 class NodeOut(OrmModel):
     id: UUID
     name: str
@@ -286,8 +328,13 @@ class TemplateIn(BaseModel):
     description: str = Field(default="", max_length=500)
     image: str = "24.04"
     cpu_count: int = Field(default=2, ge=1, le=8)
-    memory_mb: int = Field(default=2048, ge=512, le=16384)
+    # Vagrant/libvirt Ubuntu boxes frequently fail to finish their first boot
+    # and SSH provisioning with only 512 MiB, leaving launches at progress 35.
+    memory_mb: int = Field(default=2048, ge=1024, le=16384)
     disk_gb: int = Field(default=10, ge=5, le=100)
+    instance_type: str = Field(default="custom", min_length=1, max_length=40)
+    availability_zones: list[str] = Field(default_factory=list, max_length=20)
+    security_group_ids: list[UUID] = Field(default_factory=list, max_length=20)
     user_data: str = Field(default="", max_length=10000)
     key_pair_id: UUID | None = None
     create_key_pair: bool = False
@@ -298,9 +345,29 @@ class TemplateIn(BaseModel):
             raise ValueError("Choose a reusable key or one-time keys, not both")
         return self
 
+    @field_validator("availability_zones")
+    @classmethod
+    def valid_zones(cls, values: list[str]) -> list[str]:
+        for value in values:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}", value):
+                raise ValueError("Availability zones must use safe cloud identifiers")
+        return list(dict.fromkeys(values))
 
-class TemplateOut(TemplateIn, OrmModel):
+
+class TemplateOut(OrmModel):
     id: UUID
+    name: str
+    description: str
+    image: str
+    cpu_count: int
+    memory_mb: int
+    disk_gb: int
+    instance_type: str
+    availability_zones: list[str]
+    security_group_ids: list[UUID]
+    user_data: str
+    key_pair_id: UUID | None
+    create_key_pair: bool
     created_at: datetime
     updated_at: datetime
 
@@ -327,8 +394,19 @@ class GroupIn(BaseModel):
         return self
 
 
-class GroupOut(GroupIn, OrmModel):
+class GroupOut(OrmModel):
     id: UUID
+    name: str
+    launch_template_id: UUID
+    minimum_size: int
+    desired_size: int
+    maximum_size: int
+    target_cpu_percent: float
+    scale_out_threshold: float
+    scale_in_threshold: float
+    evaluation_periods: int
+    cooldown_seconds: int
+    enabled: bool
     last_scaling_at: datetime | None
     created_at: datetime
     updated_at: datetime
@@ -342,10 +420,44 @@ class DeleteGroupIn(BaseModel):
     terminate_managed_instances: bool
 
 
+class TargetGroupIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9 _.-]+$")
+    protocol: str = Field(default="HTTP", pattern=r"^HTTP$")
+    port: int = Field(default=80, ge=1, le=65535)
+    target_type: str = Field(default="instance", pattern=r"^instance$")
+    registration_type: str = Field(default="manual", pattern=r"^(manual|autoscaling)$")
+    instance_ids: list[UUID] = Field(default_factory=list, max_length=100)
+    autoscaling_group_id: UUID | None = None
+    health_check_path: str = Field(default="/", min_length=1, max_length=200)
+    health_check_interval_seconds: int = Field(default=10, ge=5, le=300)
+
+    @model_validator(mode="after")
+    def valid_registration(self) -> "TargetGroupIn":
+        if self.registration_type == "manual" and not self.instance_ids:
+            raise ValueError("Select at least one running instance")
+        if self.registration_type == "autoscaling" and not self.autoscaling_group_id:
+            raise ValueError("Select an autoscaling group")
+        if not self.health_check_path.startswith("/") or ".." in self.health_check_path:
+            raise ValueError("Health-check path must be a safe absolute path")
+        return self
+
+
+class TargetGroupOut(TargetGroupIn, OrmModel):
+    id: UUID
+    registered_targets: int
+    healthy_targets: int
+    health_status: str
+    created_at: datetime
+    updated_at: datetime
+
+
 class LoadBalancerIn(BaseModel):
     name: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9 _.-]+$")
-    autoscaling_group_id: UUID
-    algorithm: str = Field(default="round_robin", pattern=r"^(round_robin|least_connections)$")
+    target_group_id: UUID
+    algorithm: str = Field(
+        default="round_robin",
+        pattern=r"^(round_robin|least_connections|least_cpu|random|source_ip_hash)$",
+    )
     target_port: int = Field(default=80, ge=1, le=65535)
     health_check_path: str = Field(default="/", min_length=1, max_length=200)
     health_check_interval_seconds: int = Field(default=10, ge=5, le=300)
@@ -361,6 +473,9 @@ class LoadBalancerIn(BaseModel):
 
 class LoadBalancerOut(LoadBalancerIn, OrmModel):
     id: UUID
+    endpoint_path: str
+    public_endpoint: str | None
+    public_endpoint_status: str
     healthy_targets: int
     total_targets: int
     created_at: datetime
@@ -371,6 +486,7 @@ class LoadBalancerTargetOut(BaseModel):
     instance_id: UUID
     name: str
     address: str | None
+    availability_zone: str
     status: str
     healthy: bool
     active_connections: int
@@ -405,13 +521,30 @@ class SecurityGroupOut(SecurityGroupIn, OrmModel):
 class VolumeIn(BaseModel):
     name: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9 _.-]+$")
     size_gb: int = Field(default=10, ge=1, le=1024)
+    node_id: UUID
+
+
+class VolumeStorageNodeOut(BaseModel):
+    id: UUID
+    name: str
+    availability_zone: str
+    storage_total_gb: int
+    storage_allocated_gb: int
 
 
 class VolumeOut(OrmModel):
     id: UUID
     name: str
     size_gb: int
+    availability_zone: str
+    storage_backend: str
+    origin_node_id: UUID | None
+    origin_node_name: str | None = None
+    current_node_id: UUID | None = None
+    current_node_name: str | None = None
+    attachment_zone: str | None = None
     attached_instance_id: UUID | None
+    device_name: str | None
     mount_path: str | None
     created_at: datetime
     updated_at: datetime

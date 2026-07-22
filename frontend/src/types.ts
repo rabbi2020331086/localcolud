@@ -22,6 +22,10 @@ export type Instance = {
     | "ERROR"
     | "UNKNOWN";
   ipv4_address: string | null;
+  tailscale_ipv4_address: string | null;
+  tailscale_dns_name: string | null;
+  public_endpoint: string | null;
+  public_endpoint_status: "DISABLED" | "CONFIGURING" | "ACTIVE" | "ERROR";
   cpu_count: number;
   memory_mb: number;
   disk_gb: number;
@@ -64,6 +68,9 @@ export type Template = {
   cpu_count: number;
   memory_mb: number;
   disk_gb: number;
+  instance_type: string;
+  availability_zones: string[];
+  security_group_ids: string[];
   user_data: string;
   key_pair_id: string | null;
   create_key_pair: boolean;
@@ -83,17 +90,47 @@ export type Group = {
   enabled: boolean;
   last_scaling_at: string | null;
 };
+export type ScalingEvent = {
+  id: string;
+  action: string;
+  previous_size: number;
+  new_size: number;
+  reason: string;
+  average_cpu: number | null;
+  status: string;
+  created_at: string;
+};
 export type LoadBalancer = {
   id: string;
   name: string;
-  autoscaling_group_id: string;
-  algorithm: "round_robin" | "least_connections";
+  target_group_id: string;
+  algorithm: "round_robin" | "least_connections" | "least_cpu" | "random" | "source_ip_hash";
   target_port: number;
   health_check_path: string;
   health_check_interval_seconds: number;
   enabled: boolean;
+  endpoint_path: string;
+  public_endpoint: string | null;
+  public_endpoint_status: "DISABLED" | "CONFIGURING" | "ACTIVE" | "ERROR";
   healthy_targets: number;
   total_targets: number;
+  created_at: string;
+  updated_at: string;
+};
+export type TargetGroup = {
+  id: string;
+  name: string;
+  protocol: "HTTP";
+  port: number;
+  target_type: "instance";
+  registration_type: "manual" | "autoscaling";
+  instance_ids: string[];
+  autoscaling_group_id: string | null;
+  health_check_path: string;
+  health_check_interval_seconds: number;
+  registered_targets: number;
+  healthy_targets: number;
+  health_status: "healthy" | "initial" | "unhealthy";
   created_at: string;
   updated_at: string;
 };
@@ -101,6 +138,7 @@ export type LoadBalancerTarget = {
   instance_id: string;
   name: string;
   address: string | null;
+  availability_zone: string;
   status: string;
   healthy: boolean;
   active_connections: number;
@@ -141,7 +179,15 @@ export type Volume = {
   id: string;
   name: string;
   size_gb: number;
+  availability_zone: string;
+  storage_backend: string;
+  origin_node_id: string | null;
+  origin_node_name: string | null;
+  current_node_id: string | null;
+  current_node_name: string | null;
+  attachment_zone: string | null;
   attached_instance_id: string | null;
+  device_name: string | null;
   mount_path: string | null;
   created_at: string;
   updated_at: string;
@@ -149,12 +195,19 @@ export type Volume = {
   available_bytes: number;
   usage_percent: number;
 };
+export type VolumeStorageNode = {
+  id: string;
+  name: string;
+  availability_zone: string;
+  storage_total_gb: number;
+  storage_allocated_gb: number;
+};
 export type Ami = {
   id: string;
   name: string;
   description: string;
   source_instance_id: string;
-  status: "AVAILABLE";
+  status: "CREATING" | "AVAILABLE" | "FAILED";
   image: string;
   cpu_count: number;
   memory_mb: number;

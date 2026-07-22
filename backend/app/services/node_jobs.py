@@ -4,7 +4,7 @@ from uuid import UUID
 
 from app.core.config import settings
 from app.infrastructure.database import database, from_document, to_document
-from app.infrastructure.models import Instance, NodeJob, NodeJobStatus
+from app.infrastructure.models import CloudNode, Instance, NodeJob, NodeJobStatus
 from app.infrastructure.vm import ProviderUnavailable
 
 
@@ -34,10 +34,32 @@ async def create_job(
     return job
 
 
+async def create_node_job(
+    node: CloudNode, job_type: str, payload: dict[str, object]
+) -> NodeJob:
+    """Create a platform job that targets a host rather than a guest instance."""
+    job = NodeJob(node_id=node.id, job_type=job_type, payload=payload)
+    await database.node_jobs.insert_one(to_document(job))
+    return job
+
+
+async def dispatch_node(
+    node: CloudNode,
+    job_type: str,
+    payload: dict[str, object],
+    timeout: float | None = None,
+) -> dict[str, object]:
+    completed = await wait_for_job(await create_node_job(node, job_type, payload), timeout)
+    return completed.result_payload
+
+
 async def wait_for_job(job: NodeJob, timeout: float | None = None) -> NodeJob:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + (timeout if timeout is not None else settings.node_job_timeout_seconds)
     while loop.time() < deadline:
+        # Do not depend solely on the reconciliation worker to recover a node
+        # job whose agent disappeared while an operation is waiting on it.
+        await reap_expired_leases()
         current = from_document(
             NodeJob,
             await database.node_jobs.find_one({"_id": str(job.id)}),
@@ -83,6 +105,24 @@ async def dispatch(
         await create_job(instance, job_type, payload, operation_id), timeout
     )
     return completed.result_payload
+
+
+async def dispatch_secret(
+    instance: Instance,
+    job_type: str,
+    payload: dict[str, object],
+    timeout: float | None = None,
+) -> dict[str, object]:
+    """Dispatch a secret-bearing job and erase its payload as soon as it finishes."""
+    job = await create_job(instance, job_type, payload)
+    try:
+        completed = await wait_for_job(job, timeout)
+        return completed.result_payload
+    finally:
+        await database.node_jobs.update_one(
+            {"_id": str(job.id)},
+            {"$set": {"payload": {"redacted": True}, "updated_at": datetime.now(UTC)}},
+        )
 
 
 async def remote_exec(instance: Instance, command: str, timeout: float = 60) -> str:

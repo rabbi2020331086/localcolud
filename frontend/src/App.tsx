@@ -49,6 +49,22 @@ export default function App() {
         <Route path="instances/new" element={<LaunchPage />} />
         <Route path="instances/:instanceId" element={<InstanceDetailsPage />} />
         <Route
+          path="instances/:instanceId/resources"
+          element={<InstanceDetailsPage section="resources" />}
+        />
+        <Route
+          path="instances/:instanceId/analytics"
+          element={<InstanceDetailsPage section="analytics" />}
+        />
+        <Route
+          path="instances/:instanceId/actions"
+          element={<InstanceDetailsPage section="actions" />}
+        />
+        <Route
+          path="instances/:instanceId/terminal"
+          element={<TerminalPage />}
+        />
+        <Route
           path="instances/:instanceId/connect"
           element={<TerminalPage />}
         />

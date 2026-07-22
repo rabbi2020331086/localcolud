@@ -1,6 +1,8 @@
 import base64
 import io
-from datetime import UTC, datetime
+import shlex
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -9,9 +11,18 @@ from fastapi.responses import StreamingResponse
 from pymongo.errors import DuplicateKeyError
 
 from app.api.dependencies import CurrentUser
+from app.core.config import settings
 from app.core.security import fernet
 from app.infrastructure.database import Database, from_document, from_documents, to_document
-from app.infrastructure.models import Instance, InstanceStatus, KeyPair, SecurityGroup, Volume
+from app.infrastructure.models import (
+    CloudNode,
+    Instance,
+    InstanceStatus,
+    KeyPair,
+    NodeStatus,
+    SecurityGroup,
+    Volume,
+)
 from app.schemas import (
     KeyPairIn,
     KeyPairOut,
@@ -20,6 +31,7 @@ from app.schemas import (
     VolumeAttachIn,
     VolumeIn,
     VolumeOut,
+    VolumeStorageNodeOut,
 )
 from app.services import node_jobs
 from app.services.operations import key_pair, security_script
@@ -29,14 +41,20 @@ security_groups = APIRouter(prefix="/security-groups", tags=["Security groups"])
 volumes = APIRouter(prefix="/volumes", tags=["Volumes"])
 
 
-def volume_output(row: Volume) -> VolumeOut:
+def volume_output(
+    row: Volume,
+    usage: tuple[int, int, float] | None = None,
+    attachment_zone: str | None = None,
+) -> VolumeOut:
     capacity = row.size_gb * 1024**3
+    used, available, percent = usage or (0, capacity, 0)
     return VolumeOut.model_validate(
         {
             **row.model_dump(),
-            "used_bytes": 0,
-            "available_bytes": capacity,
-            "usage_percent": 0,
+            "used_bytes": used,
+            "available_bytes": available,
+            "usage_percent": percent,
+            "attachment_zone": attachment_zone,
         }
     )
 
@@ -177,30 +195,250 @@ async def volume_list(user: CurrentUser, database: Database) -> list[VolumeOut]:
         Volume,
         await database.volumes.find({"user_id": str(user.id)}).sort("name", 1).to_list(None),
     )
-    return [volume_output(row) for row in rows]
+    output: list[VolumeOut] = []
+    for row in rows:
+        usage = None
+        attachment_zone = None
+        if row.attached_instance_id and row.mount_path:
+            instance = from_document(
+                Instance,
+                await database.instances.find_one({"_id": str(row.attached_instance_id)}),
+            )
+            if instance and instance.status == InstanceStatus.RUNNING:
+                attachment_zone = instance.availability_zone
+                try:
+                    value = await node_jobs.remote_exec(
+                        instance,
+                        f"df -B1 --output=used,avail,pcent {shlex.quote(row.mount_path)} | tail -1",
+                        timeout=15,
+                    )
+                    fields = value.strip().split()
+                    usage = (int(fields[0]), int(fields[1]), float(fields[2].rstrip("%")))
+                except Exception:
+                    pass
+        node_ids = [value for value in (row.origin_node_id, row.node_id) if value]
+        nodes = {
+            str(value["_id"]): str(value.get("name") or "Unknown node")
+            for value in await database.cloud_nodes.find(
+                {"_id": {"$in": [str(value) for value in node_ids]}}
+            ).to_list(None)
+        }
+        result = volume_output(row, usage, attachment_zone)
+        result.origin_node_name = nodes.get(str(row.origin_node_id))
+        result.current_node_id = row.node_id
+        result.current_node_name = nodes.get(str(row.node_id))
+        output.append(result)
+    return output
+
+
+@volumes.get("/storage-nodes", response_model=list[VolumeStorageNodeOut])
+async def volume_storage_nodes(user: CurrentUser, database: Database) -> list[dict[str, object]]:
+    del user
+    deadline = datetime.now(UTC) - timedelta(seconds=settings.node_offline_seconds)
+    rows = await database.cloud_nodes.find(
+        {
+            "approved": True,
+            "schedulable": True,
+            "status": NodeStatus.ONLINE.value,
+            "last_seen_at": {"$gte": deadline},
+            "capabilities": "volume-create",
+        }
+    ).sort("name", 1).to_list(None)
+    return [
+        {
+            "id": row["_id"],
+            "name": row["name"],
+            "availability_zone": row["availability_zone"],
+            "storage_total_gb": int(row.get("storage_total_gb") or 0),
+            "storage_allocated_gb": int(row.get("storage_allocated_gb") or 0),
+        }
+        for row in rows
+    ]
 
 
 @volumes.post("", response_model=VolumeOut, status_code=201)
 async def volume_create(data: VolumeIn, user: CurrentUser, database: Database) -> VolumeOut:
-    raise HTTPException(
-        501,
-        "Distributed volumes require Ceph RBD or another node-accessible block-storage backend; "
-        "control-plane host directories have been disabled.",
+    deadline = datetime.now(UTC) - timedelta(seconds=settings.node_offline_seconds)
+    node = from_document(
+        CloudNode,
+        await database.cloud_nodes.find_one(
+            {
+                "_id": str(data.node_id),
+                "approved": True,
+                "schedulable": True,
+                "status": NodeStatus.ONLINE.value,
+                "last_seen_at": {"$gte": deadline},
+                "capabilities": "volume-create",
+            }
+        ),
     )
+    if not node:
+        raise HTTPException(409, "Select an online approved storage node")
+    available_gb = node.storage_total_gb - node.storage_reserved_gb - node.storage_allocated_gb
+    if node.storage_total_gb and data.size_gb > available_gb:
+        raise HTTPException(409, "The selected node does not have enough allocatable storage")
+    row = Volume(
+        user_id=user.id,
+        name=data.name,
+        size_gb=data.size_gb,
+        availability_zone=node.availability_zone,
+        host_path="",
+        storage_backend="node-synchronized",
+        node_id=node.id,
+        origin_node_id=node.id,
+        last_node_id=node.id,
+    )
+    row.host_path = str(
+        Path(settings.volume_storage_root).expanduser().resolve() / f"{row.id}.qcow2"
+    )
+    await database.volumes.insert_one(to_document(row))
+    try:
+        result = await node_jobs.dispatch_node(
+            node,
+            "VOLUME_CREATE",
+            {
+                # Agent 0.5.12 validates the common job context before it
+                # reaches the host-only volume branch. Keep a safe synthetic
+                # name so already-upgraded nodes can execute this job.
+                "name": "volume-storage",
+                "volume_id": str(row.id),
+                "size_gb": row.size_gb,
+            },
+            timeout=600,
+        )
+    except Exception as exc:
+        await database.volumes.delete_one({"_id": str(row.id)})
+        Path(row.host_path).unlink(missing_ok=True)
+        raise HTTPException(502, f"Storage node could not create the volume: {exc}") from exc
+    row.host_path = str(result.get("host_path") or row.host_path)
+    await database.volumes.update_one(
+        {"_id": str(row.id)},
+        {"$set": {"host_path": row.host_path, "updated_at": datetime.now(UTC)}},
+    )
+    result_out = volume_output(row)
+    result_out.origin_node_name = node.name
+    result_out.current_node_id = node.id
+    result_out.current_node_name = node.name
+    return result_out
 
 
 @volumes.post("/{item_id}/attach", response_model=VolumeOut)
 async def volume_attach(
     item_id: UUID, data: VolumeAttachIn, user: CurrentUser, database: Database
 ) -> VolumeOut:
-    raise HTTPException(501, "Distributed volume attachment is not configured")
+    row: Volume = await owned(database, "volumes", Volume, user.id, item_id)
+    if row.attached_instance_id:
+        raise HTTPException(409, "Volume is already attached")
+    instance = from_document(
+        Instance,
+        await database.instances.find_one(
+            {"_id": str(data.instance_id), "user_id": str(user.id), "deleted_at": None}
+        ),
+    )
+    if not instance or instance.status != InstanceStatus.RUNNING or not instance.node_id:
+        raise HTTPException(409, "Select a running distributed instance")
+    claimed = await database.volumes.update_one(
+        {
+            "_id": str(row.id),
+            "attached_instance_id": None,
+            "attachment_pending": {"$ne": True},
+        },
+        {"$set": {"attachment_pending": True, "updated_at": datetime.now(UTC)}},
+    )
+    if not claimed.modified_count:
+        raise HTTPException(409, "Volume attachment is already in progress")
+    attached = await database.volumes.find({"attached_instance_id": str(instance.id)}).to_list(None)
+    used_devices = {str(value.get("device_name")) for value in attached}
+    device_name = next(
+        (
+            f"vd{letter}"
+            for letter in "bcdefghijklmnopqrstuvwxyz"
+            if f"vd{letter}" not in used_devices
+        ),
+        None,
+    )
+    if not device_name:
+        raise HTTPException(409, "Instance has no available block-device slots")
+    try:
+        result = await node_jobs.dispatch(
+            instance,
+            "VOLUME_ATTACH",
+            {
+                "name": instance.multipass_name,
+                "volume_id": str(row.id),
+                "size_gb": row.size_gb,
+                "mount_path": data.mount_path,
+                "device_name": device_name,
+            },
+            timeout=600,
+        )
+    except Exception:
+        await database.volumes.update_one(
+            {"_id": str(row.id)}, {"$unset": {"attachment_pending": ""}}
+        )
+        raise
+    update = {
+        "attached_instance_id": str(instance.id),
+        "node_id": str(instance.node_id),
+        "origin_node_id": str(row.origin_node_id or instance.node_id),
+        "last_node_id": str(instance.node_id),
+        "device_name": str(result.get("device_name") or device_name),
+        "mount_path": data.mount_path,
+        "host_path": row.host_path,
+        "updated_at": datetime.now(UTC),
+    }
+    await database.volumes.update_one(
+        {"_id": str(row.id)}, {"$set": update, "$unset": {"attachment_pending": ""}}
+    )
+    updated = Volume.model_validate({**row.model_dump(), **update})
+    return volume_output(
+        updated,
+        (
+            int(str(result.get("used_bytes") or 0)),
+            int(str(result.get("available_bytes") or 0)),
+            float(str(result.get("usage_percent") or 0)),
+        ),
+    )
 
 
 @volumes.post("/{item_id}/detach", response_model=VolumeOut)
 async def volume_detach(item_id: UUID, user: CurrentUser, database: Database) -> VolumeOut:
-    raise HTTPException(501, "Distributed volume detachment is not configured")
+    row: Volume = await owned(database, "volumes", Volume, user.id, item_id)
+    if not row.attached_instance_id:
+        return volume_output(row)
+    instance = from_document(
+        Instance, await database.instances.find_one({"_id": str(row.attached_instance_id)})
+    )
+    if not instance or instance.status != InstanceStatus.RUNNING:
+        raise HTTPException(409, "Start the attached instance before detaching its volume")
+    await node_jobs.dispatch(
+        instance,
+        "VOLUME_DETACH",
+        {
+            "name": instance.multipass_name,
+            "mount_path": row.mount_path or "/mnt/data",
+            "device_name": row.device_name or "vdb",
+            "volume_id": str(row.id),
+        },
+        timeout=120,
+    )
+    update = {
+        "attached_instance_id": None,
+        "device_name": None,
+        "mount_path": None,
+        "node_id": None,
+        "last_node_id": str(instance.node_id),
+        "updated_at": datetime.now(UTC),
+    }
+    await database.volumes.update_one({"_id": str(row.id)}, {"$set": update})
+    return volume_output(Volume.model_validate({**row.model_dump(), **update}))
 
 
 @volumes.delete("/{item_id}", status_code=204)
 async def volume_delete(item_id: UUID, user: CurrentUser, database: Database) -> None:
-    raise HTTPException(501, "Distributed volume deletion is not configured")
+    row: Volume = await owned(database, "volumes", Volume, user.id, item_id)
+    if row.attached_instance_id:
+        raise HTTPException(409, "Detach the volume before deleting it")
+    canonical = Path(settings.volume_storage_root).expanduser().resolve() / f"{row.id}.qcow2"
+    canonical.unlink(missing_ok=True)
+    await database.volumes.delete_one({"_id": str(row.id)})

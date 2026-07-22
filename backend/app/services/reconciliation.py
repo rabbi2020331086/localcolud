@@ -16,6 +16,7 @@ def provider_status(value: str) -> InstanceStatus:
         "running": InstanceStatus.RUNNING,
         "stopped": InstanceStatus.STOPPED,
         "poweroff": InstanceStatus.STOPPED,
+        "shutoff": InstanceStatus.STOPPED,
         "starting": InstanceStatus.STARTING,
         "suspended": InstanceStatus.HIBERNATED,
     }

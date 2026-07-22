@@ -1,7 +1,7 @@
 from collections.abc import AsyncIterator, Iterable
 from enum import Enum
 from typing import Annotated, Any, TypeVar, cast
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import Depends
 from pydantic import BaseModel
@@ -10,7 +10,7 @@ from pymongo.server_api import ServerApi
 
 from app.core.config import settings
 from app.core.security import hash_password
-from app.infrastructure.models import PlatformRole, User
+from app.infrastructure.models import PlatformRole, TargetGroup, User
 
 Document = dict[str, Any]
 ModelType = TypeVar("ModelType", bound=BaseModel)
@@ -82,6 +82,46 @@ async def initialize_database() -> None:
         {"provider_name": {"$exists": False}},
         {"$set": {"provider_name": "multipass"}},
     )
+    await database.instances.update_many(
+        {"public_endpoint_status": {"$exists": False}},
+        {"$set": {"public_endpoint_status": "DISABLED"}},
+    )
+    # Convert pre-target-group load balancers without breaking existing installations.
+    legacy_load_balancers = await database.load_balancers.find(
+        {"target_group_id": {"$exists": False}, "autoscaling_group_id": {"$type": "string"}}
+    ).to_list(None)
+    for load_balancer in legacy_load_balancers:
+        target_group_id = uuid5(NAMESPACE_URL, f"localec2-target-group:{load_balancer['_id']}")
+        target_group = TargetGroup(
+            id=target_group_id,
+            user_id=UUID(load_balancer["user_id"]),
+            name=f"{load_balancer['name']} targets",
+            port=int(load_balancer.get("target_port", 80)),
+            registration_type="autoscaling",
+            autoscaling_group_id=UUID(load_balancer["autoscaling_group_id"]),
+            health_check_path=load_balancer.get("health_check_path", "/"),
+            health_check_interval_seconds=int(
+                load_balancer.get("health_check_interval_seconds", 10)
+            ),
+        )
+        target_group_document = to_document(target_group)
+        target_group_document.pop("_id", None)
+        await database.target_groups.update_one(
+            {"_id": str(target_group_id)},
+            {"$setOnInsert": target_group_document},
+            upsert=True,
+        )
+        await database.load_balancers.update_one(
+            {"_id": load_balancer["_id"]},
+            {
+                "$set": {
+                    "target_group_id": str(target_group_id),
+                    "public_endpoint_status": load_balancer.get(
+                        "public_endpoint_status", "DISABLED"
+                    ),
+                }
+            },
+        )
     await database.cloud_nodes.update_many(
         {},
         [
@@ -194,6 +234,13 @@ async def initialize_database() -> None:
     await database.one_time_secrets.create_indexes(
         [IndexModel("token_hash", unique=True), IndexModel("expires_at")]
     )
+    await database.agent_deploy_codes.create_indexes(
+        [
+            IndexModel("code_hash", unique=True),
+            IndexModel([("admin_id", ASCENDING), ("consumed_at", ASCENDING)]),
+            IndexModel("expires_at", expireAfterSeconds=0),
+        ]
+    )
     await database.launch_templates.create_indexes(
         [IndexModel([("user_id", ASCENDING), ("name", ASCENDING)], unique=True)]
     )
@@ -204,6 +251,13 @@ async def initialize_database() -> None:
         [
             IndexModel([("user_id", ASCENDING), ("name", ASCENDING)], unique=True),
             IndexModel("autoscaling_group_id"),
+        ]
+    )
+    await database.target_groups.create_indexes(
+        [
+            IndexModel([("user_id", ASCENDING), ("name", ASCENDING)], unique=True),
+            IndexModel("autoscaling_group_id"),
+            IndexModel("instance_ids"),
         ]
     )
     await database.scaling_events.create_indexes(

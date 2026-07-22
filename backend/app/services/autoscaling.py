@@ -25,6 +25,15 @@ worker_task: asyncio.Task[None] | None = None
 log = logging.getLogger("localec2.autoscaling")
 
 
+def capacity_instances(instances: list[Instance]) -> list[Instance]:
+    """Return managed instances that can still contribute to desired capacity."""
+    return [
+        instance
+        for instance in instances
+        if instance.status not in (InstanceStatus.ERROR, InstanceStatus.TERMINATING)
+    ]
+
+
 async def average_cpu(instances: list[Instance]) -> float | None:
     values: list[float] = []
     for instance in instances:
@@ -46,6 +55,18 @@ async def scale_out(group: AutoScalingGroup, current_size: int, reason: str) -> 
     )
     if not template:
         return
+    requested_zone = None
+    if template.availability_zones:
+        zone_counts: dict[str, int] = {zone: 0 for zone in template.availability_zones}
+        existing = await database.instances.find(
+            {"autoscaling_group_id": str(group.id), "deleted_at": None},
+            {"availability_zone": 1},
+        ).to_list(None)
+        for row in existing:
+            zone = str(row.get("availability_zone") or "")
+            if zone in zone_counts:
+                zone_counts[zone] += 1
+        requested_zone = min(zone_counts, key=lambda zone: (zone_counts[zone], zone))
     instance = Instance(
         user_id=group.user_id,
         autoscaling_group_id=group.id,
@@ -56,7 +77,9 @@ async def scale_out(group: AutoScalingGroup, current_size: int, reason: str) -> 
         cpu_count=template.cpu_count,
         memory_mb=template.memory_mb,
         disk_gb=template.disk_gb,
+        instance_type=template.instance_type,
         key_pair_id=template.key_pair_id,
+        security_group_ids=template.security_group_ids,
         availability_zone="pending-placement",
     )
     operation = Operation(
@@ -67,6 +90,7 @@ async def scale_out(group: AutoScalingGroup, current_size: int, reason: str) -> 
             "create_key_pair": template.create_key_pair,
             "autoscaling_group_id": str(group.id),
             "user_data": template.user_data,
+            "availability_zone": requested_zone,
         },
     )
     event = ScalingEvent(
@@ -81,7 +105,7 @@ async def scale_out(group: AutoScalingGroup, current_size: int, reason: str) -> 
     )
     await database.instances.insert_one(to_document(instance))
     try:
-        instance = await scheduler.reserve_instance(database, instance)
+        instance = await scheduler.reserve_instance(database, instance, requested_zone)
         await database.scaling_events.insert_one(to_document(event))
         await database.operations.insert_one(to_document(operation))
     except Exception as exc:
@@ -166,10 +190,11 @@ async def evaluate_group(group: AutoScalingGroup) -> None:
     instance_documents = await database.instances.find(
         {"autoscaling_group_id": str(group.id), "deleted_at": None}
     ).to_list(length=None)
-    instances = from_documents(Instance, instance_documents)
-    if instances and await database.operations.find_one(
+    all_instances = from_documents(Instance, instance_documents)
+    instances = capacity_instances(all_instances)
+    if all_instances and await database.operations.find_one(
         {
-            "instance_id": {"$in": [str(item.id) for item in instances]},
+            "instance_id": {"$in": [str(item.id) for item in all_instances]},
             "status": {"$in": [OperationStatus.PENDING, OperationStatus.RUNNING]},
         }
     ):

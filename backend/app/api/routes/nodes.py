@@ -1,15 +1,17 @@
 import hmac
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException, Response
+from fastapi import APIRouter, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from app.api.dependencies import PlatformOperator
+from app.api.routes.agent_management import published_agent_path
 from app.core.config import settings
 from app.core.security import opaque_token, token_hash
 from app.infrastructure.database import Database, from_document, from_documents, to_document
@@ -92,7 +94,9 @@ async def rotate_token(
     node = await existing(database, node_id)
     secret = opaque_token()
     now = datetime.now(UTC)
-    changes = {"agent_token_hash": token_hash(secret), "updated_at": now}
+    # Stage reconnect credentials instead of invalidating a healthy agent. The
+    # pending token is promoted atomically on its first authenticated request.
+    changes = {"pending_agent_token_hash": token_hash(secret), "updated_at": now}
     await database.cloud_nodes.update_one({"_id": str(node.id)}, {"$set": changes})
     updated = CloudNode.model_validate({**node.model_dump(), **changes})
     return NodeEnrollmentOut.model_validate(
@@ -166,8 +170,33 @@ async def authenticated_node(
         raise HTTPException(401, "Node enrollment token is required")
     supplied_hash = token_hash(authorization.removeprefix("Bearer ").strip())
     node = from_document(CloudNode, await database.cloud_nodes.find_one({"_id": str(node_id)}))
-    if not node or not hmac.compare_digest(node.agent_token_hash, supplied_hash):
+    if not node:
         raise HTTPException(401, "Invalid node enrollment token")
+    active = hmac.compare_digest(node.agent_token_hash, supplied_hash)
+    pending = bool(
+        node.pending_agent_token_hash
+        and hmac.compare_digest(node.pending_agent_token_hash, supplied_hash)
+    )
+    if not active and not pending:
+        raise HTTPException(401, "Invalid node enrollment token")
+    if pending:
+        # The newly installed agent has proved possession. Promote its token
+        # now, invalidating the previous installation only after handover.
+        await database.cloud_nodes.update_one(
+            {
+                "_id": str(node.id),
+                "pending_agent_token_hash": node.pending_agent_token_hash,
+            },
+            {
+                "$set": {
+                    "agent_token_hash": supplied_hash,
+                    "updated_at": datetime.now(UTC),
+                },
+                "$unset": {"pending_agent_token_hash": ""},
+            },
+        )
+        node.agent_token_hash = supplied_hash
+        node.pending_agent_token_hash = None
     return node
 
 
@@ -299,7 +328,7 @@ async def ubuntu_installer() -> FileResponse:
 
 @agent_files.get("/agent.py", response_class=FileResponse, include_in_schema=False)
 async def agent_program() -> FileResponse:
-    path = Path(__file__).resolve().parents[2] / "agent.py"
+    path = published_agent_path()
     if not path.is_file():
         raise HTTPException(404, "Node agent is not available")
     return FileResponse(path, media_type="text/x-python", filename="agent.py")
@@ -311,3 +340,117 @@ async def agent_service() -> FileResponse:
     if not path.is_file():
         raise HTTPException(404, "Node agent service definition is not available")
     return FileResponse(path, media_type="text/plain", filename="localec2-agent.service")
+
+
+def volume_storage_path(volume_id: UUID) -> Path:
+    root = Path(settings.volume_storage_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"{volume_id}.qcow2"
+
+
+def ami_storage_path(ami_id: UUID) -> Path:
+    root = Path(settings.ami_storage_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"{ami_id}.box"
+
+
+@agent_files.get(
+    "/nodes/{node_id}/amis/{ami_id}", response_class=FileResponse, include_in_schema=False
+)
+async def download_ami(
+    node_id: UUID,
+    ami_id: UUID,
+    database: Database,
+    authorization: Annotated[str | None, Header()] = None,
+) -> FileResponse:
+    await authenticated_node(database, node_id, authorization)
+    if not await database.amis.find_one({"_id": str(ami_id), "status": "AVAILABLE"}):
+        raise HTTPException(404, "AMI not found")
+    path = ami_storage_path(ami_id)
+    if not path.is_file():
+        raise HTTPException(404, "AMI image has not been replicated")
+    return FileResponse(path, media_type="application/octet-stream", filename=path.name)
+
+
+@agent_files.put("/nodes/{node_id}/amis/{ami_id}", status_code=204, include_in_schema=False)
+async def upload_ami(
+    node_id: UUID,
+    ami_id: UUID,
+    request: Request,
+    database: Database,
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    await authenticated_node(database, node_id, authorization)
+    ami = await database.amis.find_one({"_id": str(ami_id), "node_id": str(node_id)})
+    if not ami:
+        raise HTTPException(404, "AMI capture is not assigned to this node")
+    path = ami_storage_path(ami_id)
+    temporary = path.with_suffix(".uploading")
+    written = 0
+    maximum = (int(ami["disk_gb"]) * 1024**3) + 1024**3
+    try:
+        with temporary.open("wb") as target:
+            async for chunk in request.stream():
+                written += len(chunk)
+                if written > maximum:
+                    raise HTTPException(413, "Uploaded AMI exceeds its configured capacity")
+                target.write(chunk)
+        if not written:
+            raise HTTPException(400, "Uploaded AMI is empty")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@agent_files.get(
+    "/nodes/{node_id}/volumes/{volume_id}",
+    response_class=FileResponse,
+    include_in_schema=False,
+)
+async def download_volume(
+    node_id: UUID,
+    volume_id: UUID,
+    database: Database,
+    authorization: Annotated[str | None, Header()] = None,
+) -> FileResponse:
+    await authenticated_node(database, node_id, authorization)
+    if not await database.volumes.find_one({"_id": str(volume_id)}):
+        raise HTTPException(404, "Volume not found")
+    path = volume_storage_path(volume_id)
+    if not path.is_file():
+        raise HTTPException(404, "Volume has no synchronized backing image yet")
+    return FileResponse(path, media_type="application/octet-stream", filename=path.name)
+
+
+@agent_files.put(
+    "/nodes/{node_id}/volumes/{volume_id}",
+    status_code=204,
+    include_in_schema=False,
+)
+async def upload_volume(
+    node_id: UUID,
+    volume_id: UUID,
+    request: Request,
+    database: Database,
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    await authenticated_node(database, node_id, authorization)
+    volume = await database.volumes.find_one({"_id": str(volume_id)})
+    if not volume:
+        raise HTTPException(404, "Volume not found")
+    path = volume_storage_path(volume_id)
+    temporary = path.with_suffix(".uploading")
+    written = 0
+    maximum = (int(volume["size_gb"]) * 1024**3) + 64 * 1024**2
+    try:
+        with temporary.open("wb") as target:
+            async for chunk in request.stream():
+                written += len(chunk)
+                if written > maximum:
+                    raise HTTPException(413, "Uploaded volume exceeds its configured capacity")
+                target.write(chunk)
+        if written == 0:
+            raise HTTPException(400, "Uploaded volume is empty")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)

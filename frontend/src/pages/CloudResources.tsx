@@ -16,6 +16,7 @@ import {
   useKeyPairs,
   useSecurityGroups,
   useVolumes,
+  useVolumeStorageNodes,
 } from "../hooks/data";
 
 export function AmisPage() {
@@ -23,19 +24,39 @@ export function AmisPage() {
   const { data: instances = [] } = useInstances();
   const qc = useQueryClient();
   const [error, setError] = useState("");
-  const stopped = instances.filter((item) => item.status === "STOPPED");
+  const [amiBusy, setAmiBusy] = useState("");
+  const capturingSources = new Set(
+    data.filter((ami) => ami.status === "CREATING").map((ami) => ami.source_instance_id),
+  );
+  const stopped = instances.filter(
+    (item) => item.status === "STOPPED" && !capturingSources.has(item.id),
+  );
   return (
     <>
       <PageHeader
         title="AMIs"
-        description="Distributed machine images require replicated image storage across compute nodes."
+        description="Capture a stopped instance once and launch the replicated image on any compute node."
       />
-      <ErrorAlert>AMI capture and deletion are intentionally disabled until cross-node image replication is configured. Standard Ubuntu boxes remain available when launching instances.</ErrorAlert>
       {error && <ErrorAlert>{error}</ErrorAlert>}
       <Card>
         <form
           onSubmit={(event) => {
             event.preventDefault();
+            const form = new FormData(event.currentTarget);
+            const formElement = event.currentTarget;
+            setError(""); setAmiBusy("create");
+            const request = api.post("/amis", {
+              name: form.get("name"),
+              source_instance_id: form.get("source_instance_id"),
+              description: form.get("description"),
+            });
+            window.setTimeout(() => {
+              void qc.invalidateQueries({ queryKey: ["amis"] });
+            }, 500);
+            void request.then(() => {
+              formElement.reset();
+              void qc.invalidateQueries({ queryKey: ["amis"] });
+            }).catch((value) => setError(message(value))).finally(() => setAmiBusy(""));
           }}
         >
           <div className="fields">
@@ -58,9 +79,9 @@ export function AmisPage() {
             </label>
           </div>
           <div className="form-actions">
-            <Button disabled>
+            <Button disabled={!stopped.length || amiBusy === "create"}>
               <Plus />
-              Create AMI
+              {amiBusy === "create" ? "Capturing and replicating…" : "Create AMI"}
             </Button>
           </div>
           {stopped.length === 0 && <small>Stop an instance before creating an AMI.</small>}
@@ -79,16 +100,22 @@ export function AmisPage() {
                 {data.map((ami) => (
                   <tr key={ami.id}>
                     <td><strong>{ami.name}</strong><small>{ami.description}</small></td>
-                    <td><Status value={ami.status} /></td>
+                    <td>
+                      <Status value={ami.status} />
+                      {ami.status === "CREATING" && <small>Capturing and replicating…</small>}
+                      {ami.status === "FAILED" && <small>Capture failed</small>}
+                    </td>
                     <td>Ubuntu {ami.image}</td>
                     <td>{ami.cpu_count} vCPU · {ami.memory_mb / 1024} GB · {ami.disk_gb} GB</td>
                     <td>{new Date(ami.created_at).toLocaleDateString()}</td>
-                    <td><button className="danger-icon" disabled title="Distributed AMI deletion is not enabled" onClick={async () => {
+                    <td><button className="danger-icon" disabled={amiBusy === ami.id || ami.status === "CREATING"} title={ami.status === "CREATING" ? "AMI capture in progress" : "Delete replicated AMI"} onClick={async () => {
                       if (!confirm(`Delete AMI ${ami.name}?`)) return;
                       try {
+                        setAmiBusy(ami.id); setError("");
                         await api.delete(`/amis/${ami.id}`);
                         void qc.invalidateQueries({ queryKey: ["amis"] });
                       } catch (value) { setError(message(value)); }
+                      finally { setAmiBusy(""); }
                     }}><Trash2 /></button></td>
                   </tr>
                 ))}
@@ -444,22 +471,35 @@ export function SecurityGroupsPage() {
 
 export function VolumesPage() {
   const { data = [] } = useVolumes();
+  const storageNodes = useVolumeStorageNodes();
   const instances = useInstances();
   const qc = useQueryClient();
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
   const refresh = () => void qc.invalidateQueries({ queryKey: ["volumes"] });
   return (
     <>
       <PageHeader
         title="Volumes"
-        description="Network block storage will be enabled after replicated storage is configured across nodes."
+        description="Create block storage on a selected compute node, then synchronize it securely when attaching to an instance on any other node."
       />
-      <ErrorAlert>Volume create, attach, detach, and delete are disabled because host-directory storage cannot provide EBS-style durability or cross-node failover.</ErrorAlert>
       {error && <ErrorAlert>{error}</ErrorAlert>}
       <Card>
         <form
           onSubmit={(event) => {
             event.preventDefault();
+            const formElement = event.currentTarget;
+            const form = new FormData(formElement);
+            setBusy("create");
+            setError("");
+            void api.post("/volumes", {
+              name: form.get("name"),
+              size_gb: Number(form.get("size")),
+              node_id: form.get("node_id"),
+            }).then(() => {
+              formElement.reset();
+              refresh();
+            }).catch((value) => setError(message(value))).finally(() => setBusy(""));
           }}
         >
           <div className="fields">
@@ -477,9 +517,23 @@ export function VolumesPage() {
                 defaultValue="10"
               />
             </label>
+            <label>
+              Storage placement
+              <select name="node_id" required defaultValue="">
+                <option value="" disabled>Select an online node</option>
+                {storageNodes.data?.map((node) => (
+                  <option value={node.id} key={node.id}>
+                    {node.name} · {node.availability_zone} · {Math.max(0, node.storage_total_gb - node.storage_allocated_gb)} GB free
+                  </option>
+                ))}
+              </select>
+              {!storageNodes.isLoading && !storageNodes.data?.length && (
+                <small>Deploy agent 0.5.12 or newer to an online approved node to enable node-backed volume creation.</small>
+              )}
+            </label>
           </div>
           <div className="form-actions">
-            <Button disabled>
+            <Button disabled={busy === "create" || !storageNodes.data?.length}>
               <Plus />
               Create volume
             </Button>
@@ -506,13 +560,17 @@ export function VolumesPage() {
                 </div>
                 <button
                   className="danger-icon"
-                  disabled
+                  disabled={Boolean(volume.attached_instance_id) || busy === volume.id}
                   onClick={async () => {
                     if (
                       confirm("Permanently delete this volume and its data?")
                     ) {
-                      await api.delete(`/volumes/${volume.id}`);
-                      refresh();
+                      try {
+                        setBusy(volume.id);
+                        await api.delete(`/volumes/${volume.id}`);
+                        refresh();
+                      } catch (value) { setError(message(value)); }
+                      finally { setBusy(""); }
                     }
                   }}
                 >
@@ -522,9 +580,18 @@ export function VolumesPage() {
               <p>
                 {volume.size_gb} GB logical capacity ·{" "}
                 {volume.attached_instance_id
-                  ? `Mounted at ${volume.mount_path}`
-                  : "Available"}
+                  ? `${volume.device_name ?? "block device"} mounted at ${volume.mount_path} in ${volume.attachment_zone ?? "assigned zone"}`
+                  : `Stored on ${volume.current_node_name ?? volume.origin_node_name ?? "selected node"} · attachable across nodes`}
               </p>
+              <div className="chips">
+                <span>{volume.storage_backend.replaceAll("-", " ")}</span>
+                <span>
+                  Origin: {volume.origin_node_name ?? volume.availability_zone}
+                </span>
+                {volume.attachment_zone && (
+                  <span>Attached in {volume.attachment_zone}</span>
+                )}
+              </div>
               <div>
                 <progress value={volume.usage_percent} max="100" />
                 <p>
@@ -536,14 +603,15 @@ export function VolumesPage() {
               {volume.attached_instance_id ? (
                 <Button
                   className="secondary"
-                  disabled
+                  disabled={busy === volume.id}
                   onClick={async () => {
                     try {
+                      setBusy(volume.id);
                       await api.post(`/volumes/${volume.id}/detach`);
                       refresh();
                     } catch (value) {
                       setError(message(value));
-                    }
+                    } finally { setBusy(""); }
                   }}
                 >
                   <Link2Off />
@@ -553,6 +621,13 @@ export function VolumesPage() {
                 <form
                   onSubmit={(event) => {
                     event.preventDefault();
+                    const form = new FormData(event.currentTarget);
+                    setBusy(volume.id);
+                    setError("");
+                    void api.post(`/volumes/${volume.id}/attach`, {
+                      instance_id: form.get("instance"),
+                      mount_path: form.get("path"),
+                    }).then(refresh).catch((value) => setError(message(value))).finally(() => setBusy(""));
                   }}
                 >
                   <label>
@@ -573,7 +648,7 @@ export function VolumesPage() {
                   </label>
                   <div className="form-actions">
                     <Button
-                      disabled
+                      disabled={busy === volume.id || !instances.data?.some((item) => item.status === "RUNNING")}
                     >
                       <Link />
                       Attach

@@ -99,6 +99,29 @@ async def template_owned(database: Database, user_id: UUID, item_id: UUID) -> La
     return row
 
 
+async def validate_template_references(database: Database, user_id: UUID, data: TemplateIn) -> None:
+    if data.key_pair_id and not await database.key_pairs.find_one(
+        {"_id": str(data.key_pair_id), "user_id": str(user_id)}
+    ):
+        raise HTTPException(404, "Key pair not found")
+    security_count = await database.security_groups.count_documents(
+        {
+            "_id": {"$in": [str(value) for value in data.security_group_ids]},
+            "user_id": str(user_id),
+        }
+    )
+    if security_count != len(set(data.security_group_ids)):
+        raise HTTPException(404, "One or more security groups were not found")
+    if data.availability_zones:
+        known = await database.cloud_nodes.distinct(
+            "availability_zone",
+            {"availability_zone": {"$in": data.availability_zones}},
+        )
+        missing = sorted(set(data.availability_zones).difference(known))
+        if missing:
+            raise HTTPException(422, f"Unknown availability zones: {', '.join(missing)}")
+
+
 @templates.get("", response_model=list[TemplateOut])
 async def template_list(user: CurrentUser, database: Database) -> list[LaunchTemplate]:
     documents = (
@@ -113,10 +136,7 @@ async def template_list(user: CurrentUser, database: Database) -> list[LaunchTem
 async def template_create(
     data: TemplateIn, user: CurrentUser, database: Database
 ) -> LaunchTemplate:
-    if data.key_pair_id and not await database.key_pairs.find_one(
-        {"_id": str(data.key_pair_id), "user_id": str(user.id)}
-    ):
-        raise HTTPException(404, "Key pair not found")
+    await validate_template_references(database, user.id, data)
     row = LaunchTemplate(user_id=user.id, **data.model_dump())
     try:
         await database.launch_templates.insert_one(to_document(row))
@@ -135,10 +155,7 @@ async def template_patch(
     item_id: UUID, data: TemplateIn, user: CurrentUser, database: Database
 ) -> LaunchTemplate:
     row = await template_owned(database, user.id, item_id)
-    if data.key_pair_id and not await database.key_pairs.find_one(
-        {"_id": str(data.key_pair_id), "user_id": str(user.id)}
-    ):
-        raise HTTPException(404, "Key pair not found")
+    await validate_template_references(database, user.id, data)
     update = data.model_dump()
     update["updated_at"] = datetime.now(UTC)
     try:
@@ -245,8 +262,8 @@ async def group_delete(
     item_id: UUID, data: DeleteGroupIn, user: CurrentUser, database: Database
 ) -> None:
     row = await group_owned(database, user.id, item_id)
-    if await database.load_balancers.find_one({"autoscaling_group_id": str(row.id)}):
-        raise HTTPException(409, "Delete the group's load balancer first")
+    if await database.target_groups.find_one({"autoscaling_group_id": str(row.id)}):
+        raise HTTPException(409, "Delete the group's autoscaling target group first")
     # Prevent the autoscaling worker from scheduling more instances while
     # cleanup operations are being queued.
     await database.autoscaling_groups.update_one(
