@@ -22,3 +22,21 @@ runtime/
 Thumbs.db
 .DS_Store
 backend/data/recovery-points/
+# Backend runtime storage
+backend/data/volumes/
+backend/data/amis/
+backend/data/recovery-points/
+
+# Large VM files
+*.qcow2
+*.box
+*.img
+*.iso
+
+# Local sensitive node setup
+enroll-node.md
+
+# Environment files
+frontend/.env
+admin-frontend/.env
+backend/.env
