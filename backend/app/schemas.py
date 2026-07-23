@@ -242,6 +242,18 @@ class HostCommandIn(BaseModel):
         return value
 
 
+class ReplicationPolicyIn(BaseModel):
+    enabled: bool = False
+    interval_minutes: int = Field(default=30, ge=5, le=1440)
+    replica_count: int = Field(default=2, ge=1, le=2)
+    retention_points: int = Field(default=3, ge=1, le=20)
+    pause_seconds_warning: int = Field(default=30, ge=5, le=600)
+
+
+class RecoveryRequestIn(BaseModel):
+    target_node_id: UUID | None = None
+
+
 class AgentUpdateIn(BaseModel):
     control_plane_url: str = Field(min_length=12, max_length=500)
 
@@ -279,6 +291,11 @@ class NodeOut(OrmModel):
     network_interfaces: list[dict[str, str]]
     virtual_networks: list[str]
     last_seen_at: datetime | None
+    last_gc_at: datetime | None = None
+    last_gc_status: str | None = None
+    last_gc_removed: dict[str, int] = Field(default_factory=dict)
+    last_gc_reclaimed_bytes: int = 0
+    last_gc_error: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -306,6 +323,18 @@ class AgentJobResult(BaseModel):
     succeeded: bool
     result_payload: dict[str, object] = Field(default_factory=dict)
     error_message: str | None = Field(default=None, max_length=4000)
+
+
+class AgentJobProgress(BaseModel):
+    progress: int = Field(ge=0, le=100)
+    message: str = Field(min_length=1, max_length=200)
+
+
+class AgentGcReport(BaseModel):
+    status: str = Field(pattern=r"^(SUCCEEDED|FAILED)$")
+    removed: dict[str, int] = Field(default_factory=dict)
+    reclaimed_bytes: int = Field(default=0, ge=0)
+    error: str | None = Field(default=None, max_length=1000)
 
 
 class OperationOut(OrmModel):

@@ -43,6 +43,40 @@ export type Instance = {
   created_at: string;
   updated_at: string;
 };
+export type ReplicationPolicy = {
+  id: string;
+  user_id: string;
+  instance_id: string;
+  enabled: boolean;
+  interval_minutes: number;
+  replica_count: number;
+  retention_points: number;
+  pause_seconds_warning: number;
+  updated_at: string;
+};
+export type RecoveryPoint = {
+  id: string;
+  instance_id: string;
+  source_node_id: string;
+  source_node: string | null;
+  status: "CREATING" | "AVAILABLE" | "FAILED";
+  size_bytes: number;
+  pause_seconds: number;
+  sha256: string | null;
+  canonical_present: boolean;
+  replica_node_ids: string[];
+  replica_nodes: string[];
+  automatic: boolean;
+  error_message: string | null;
+  progress: number;
+  progress_message: string;
+  created_at: string;
+  completed_at: string | null;
+};
+export type InstanceReplication = {
+  policy: ReplicationPolicy;
+  points: RecoveryPoint[];
+};
 export type ZoneCapacity = {
   availability_zone: string;
   available: boolean;

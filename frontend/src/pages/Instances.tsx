@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   BarChart3,
   Cpu,
+  Download,
   ExternalLink,
   Gauge,
   HardDrive,
@@ -22,9 +23,9 @@ import {
   Trash2,
 } from "lucide-react";
 import { Link, NavLink, useNavigate, useParams } from "react-router-dom";
-import { useEffect, useRef, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Area,
   AreaChart,
@@ -55,7 +56,7 @@ import {
   useSecurityGroups,
   useTemplates,
 } from "../hooks/data";
-import type { Instance, Metric, Operation, ZoneCapacity } from "../types";
+import type { Instance, InstanceReplication, Metric, Operation, ZoneCapacity } from "../types";
 function useKeyDownloads(operations: Operation[]) {
   const handled = useRef(new Set<string>());
   useEffect(() => {
@@ -176,6 +177,7 @@ type Launch = {
 };
 export function LaunchPage() {
   const nav = useNavigate();
+  const [launchError, setLaunchError] = useState("");
   const {
     register,
     watch,
@@ -253,7 +255,7 @@ export function LaunchPage() {
   const zones = useQuery({
     queryKey: ["capacity-zones"],
     queryFn: () => api.get<ZoneCapacity[]>("/instances/capacity/zones").then(response => response.data),
-    refetchInterval: 10000,
+    refetchInterval: 1000,
   });
   const requestedZone = watch("availability_zone");
   const userData = watch("user_data");
@@ -262,6 +264,7 @@ export function LaunchPage() {
     ? eligibleZones.some((zone) => zone.availability_zone === requestedZone)
     : eligibleZones.length > 0;
   const submit = handleSubmit(async (values) => {
+    setLaunchError("");
     const effective = selectedTemplate ? {
       ...values,
       description: selectedTemplate.description,
@@ -284,15 +287,22 @@ export function LaunchPage() {
       : effective.image_choice.slice(5);
     const { image_choice: _imageChoice, ...payload } = effective;
     void _imageChoice;
-    const { data } = await api.post<{ instance_id: string }>("/instances", {
-      ...payload,
-      image,
-      ami_id: amiId,
-      key_pair_id: effective.key_pair_id || null,
-      create_key_pair: effective.key_pair_id ? false : effective.create_key_pair,
-      availability_zone: effective.availability_zone || null,
-    });
-    nav(`/instances/${data.instance_id}`);
+    try {
+      const { data } = await api.post<{ instance_id: string }>("/instances", {
+        ...payload,
+        launch_template_id: effective.launch_template_id || null,
+        image,
+        ami_id: amiId,
+        key_pair_id: effective.key_pair_id || null,
+        create_key_pair: effective.key_pair_id ? false : effective.create_key_pair,
+        availability_zone: effective.availability_zone || null,
+      });
+      nav(`/instances/${data.instance_id}`);
+    } catch (error) {
+      setLaunchError(message(error));
+    }
+  }, () => {
+    setLaunchError("Complete the highlighted instance fields before launching.");
   });
   return (
     <>
@@ -300,9 +310,10 @@ export function LaunchPage() {
         title="Launch instance"
         description="Choose a failure domain; the scheduler reserves an approved node before launch."
       />
+      {launchError && <ErrorAlert>{launchError}</ErrorAlert>}
       <div className="form-grid">
         <Card>
-          <form onSubmit={submit}>
+          <form onSubmit={submit} noValidate>
             <label className="template-launch-picker">
               Launch template
               <select {...register("launch_template_id")}>
@@ -547,7 +558,7 @@ systemctl enable --now nginx
             </details>
             <div className="form-actions">
               <Link to="/instances">Cancel</Link>
-              <Button disabled={isSubmitting || !requestedCapacityAvailable}>
+              <Button type="submit" disabled={isSubmitting}>
                 {isSubmitting ? "Queuing…" : "Launch instance"}
               </Button>
             </div>
@@ -595,6 +606,74 @@ function MetricChart({ title, data, dataKey, color = "#087d9d", unit = "%" }: { 
   return <Card className="instance-chart-card"><div className="chart-head"><h3>{title}</h3><strong>{typeof latest === "number" ? latest.toFixed(unit === "%" ? 1 : 0) : "—"} {unit}</strong></div><ResponsiveContainer width="100%" height={190}><AreaChart data={data}><defs><linearGradient id={`fill-${String(dataKey)}`} x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={color} stopOpacity={0.3}/><stop offset="95%" stopColor={color} stopOpacity={0}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5edf0"/><XAxis dataKey="timestamp" hide/><YAxis domain={unit === "%" ? [0, 100] : ["auto", "auto"]} width={34}/><Tooltip labelFormatter={(value) => new Date(String(value)).toLocaleTimeString()}/><Area type="monotone" dataKey={dataKey} stroke={color} fill={`url(#fill-${String(dataKey)})`} strokeWidth={2} isAnimationActive={false}/></AreaChart></ResponsiveContainer></Card>;
 }
 
+function ReplicationControls({ instance }: { instance: Instance }) {
+  const queryClient = useQueryClient();
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const replication = useQuery({
+    queryKey: ["instance-replication", instance.id],
+    queryFn: () => api.get<InstanceReplication>(`/instances/${instance.id}/replication`).then(response => response.data),
+    refetchInterval: 1000,
+  });
+  const refresh = () => queryClient.invalidateQueries({ queryKey: ["instance-replication", instance.id] });
+  const save = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setBusy("policy"); setError("");
+    try {
+      await api.put(`/instances/${instance.id}/replication/policy`, {
+        enabled: form.get("enabled") === "on",
+        interval_minutes: Number(form.get("interval_minutes")),
+        replica_count: Number(form.get("replica_count")),
+        retention_points: Number(form.get("retention_points")),
+        pause_seconds_warning: Number(form.get("pause_seconds_warning")),
+      });
+      await refresh();
+    } catch (value) { setError(message(value)); }
+    finally { setBusy(""); }
+  };
+  const snapshot = async () => {
+    setBusy("snapshot"); setError("");
+    try { await api.post(`/instances/${instance.id}/recovery-points`); await refresh(); }
+    catch (value) { setError(message(value)); }
+    finally { setBusy(""); }
+  };
+  const remove = async (pointId: string) => {
+    if (!confirm("Delete this recovery point and its reachable replica copies?")) return;
+    setBusy(pointId); setError("");
+    try { await api.delete(`/instances/${instance.id}/recovery-points/${pointId}`); await refresh(); }
+    catch (value) { setError(message(value)); }
+    finally { setBusy(""); }
+  };
+  const download = async (pointId: string) => {
+    setBusy(`download-${pointId}`); setError("");
+    try {
+      const response = await api.get(`/instances/${instance.id}/recovery-points/${pointId}/download`, { responseType: "blob" });
+      const url = URL.createObjectURL(response.data as Blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${instance.display_name}-${pointId}.qcow2`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (value) { setError(message(value)); }
+    finally { setBusy(""); }
+  };
+  if (replication.isLoading || !replication.data) return <Card><Loading /></Card>;
+  const { policy, points } = replication.data;
+  return <Card><HardDrive/><h2>Snapshots and recovery protection</h2><p>Take a snapshot whenever you choose, or schedule root-disk protection for this instance. Available snapshots can be downloaded for safekeeping or deleted when no longer needed.</p>{error && <ErrorAlert>{error}</ErrorAlert>}<form className="replication-user-form" onSubmit={save}><label className="check"><input name="enabled" type="checkbox" defaultChecked={policy.enabled}/>Enable scheduled snapshots</label><label>Schedule interval (minutes)<input name="interval_minutes" type="number" min="5" max="1440" defaultValue={policy.interval_minutes}/></label><label>Copies on other laptops<select name="replica_count" defaultValue={policy.replica_count}><option value="1">1 replica</option><option value="2">2 replicas</option></select></label><label>Snapshots to retain<input name="retention_points" type="number" min="1" max="20" defaultValue={policy.retention_points}/></label><input name="pause_seconds_warning" type="hidden" value={policy.pause_seconds_warning}/><div className="instance-action-buttons"><Button type="submit" disabled={Boolean(busy)}><Settings2/>{busy === "policy" ? "Saving…" : "Save snapshot policy"}</Button><Button type="button" className="secondary" disabled={Boolean(busy) || !["RUNNING","STOPPED","HIBERNATED"].includes(instance.status)} onClick={() => void snapshot()}><HardDrive/>{busy === "snapshot" ? "Creating snapshot…" : "Take snapshot now"}</Button></div></form><div className="table-wrap"><table><thead><tr><th>Created</th><th>Type</th><th>Size</th><th>Replica laptops</th><th>Status</th><th>Actions</th></tr></thead><tbody>{points.map(point => <tr key={point.id}><td>{new Date(point.completed_at ?? point.created_at).toLocaleString()}</td><td>{point.automatic ? "Scheduled" : "Manual"}<small>Pause {point.pause_seconds.toFixed(1)}s</small></td><td>{(point.size_bytes / 1024 ** 3).toFixed(2)} GB</td><td>{point.replica_nodes.join(", ") || "No laptop copy"}</td><td><Status value={point.status}/>{point.status === "CREATING" && <small>{point.progress}% · {point.progress_message}</small>}{point.error_message && <small>{point.error_message}</small>}</td><td><div className="snapshot-row-actions"><Button className="secondary" disabled={point.status !== "AVAILABLE" || Boolean(busy)} onClick={() => void download(point.id)}><Download/>Download</Button><Button className="secondary" disabled={point.status === "CREATING" || Boolean(busy)} onClick={() => void remove(point.id)}><Trash2/>Delete</Button></div></td></tr>)}</tbody></table>{!points.length && <Empty title="No snapshots yet" detail="Take one manually or enable the schedule."/>}</div></Card>;
+}
+
+function SnapshotProgressBanner({ instanceId }: { instanceId: string }) {
+  const replication = useQuery({
+    queryKey: ["instance-replication", instanceId],
+    queryFn: () => api.get<InstanceReplication>(`/instances/${instanceId}/replication`).then(response => response.data),
+    refetchInterval: 1000,
+  });
+  const active = replication.data?.points.find(point => point.status === "CREATING");
+  if (!active) return null;
+  return <Card className="snapshot-progress-banner"><div><HardDrive/><span><strong>Creating snapshot · {active.progress}%</strong><small>{active.progress_message}</small></span></div><progress value={active.progress} max="100"/></Card>;
+}
+
 export function InstanceDetailsPage({ section = "description" }: { section?: InstanceSection }) {
   const { instanceId = "" } = useParams();
   const navigate = useNavigate();
@@ -614,12 +693,12 @@ export function InstanceDetailsPage({ section = "description" }: { section?: Ins
     queryKey: ["instance-metric-snapshot", instanceId],
     queryFn: () => api.get<Metric>(`/instances/${instanceId}/metrics/snapshot`).then(response => response.data),
     enabled: item?.status === "RUNNING" && ["resources", "analytics"].includes(section),
-    refetchInterval: 5000,
+    refetchInterval: 1000,
     retry: false,
   });
   useEffect(() => {
     const sample = metricQuery.data;
-    if (sample) setSamples(old => [...old, sample].slice(-60));
+    if (sample) setSamples(old => [...old, sample].slice(-300));
   }, [metricQuery.data]);
   useKeyDownloads(
     operations.filter((operation) => operation.instance_id === instanceId),
@@ -650,6 +729,8 @@ export function InstanceDetailsPage({ section = "description" }: { section?: Ins
         action={<Status value={item.status} />}
       />
       <InstanceSubnav instanceId={item.id} />
+      <SnapshotProgressBanner instanceId={item.id} />
+      {section === "actions" && <ReplicationControls instance={item} />}
       {active && (
         <Card className="operation-banner">
           <div>

@@ -17,7 +17,9 @@ from app.core.security import opaque_token, token_hash
 from app.infrastructure.database import Database, from_document, from_documents, to_document
 from app.infrastructure.models import CloudNode, NodeJob, NodeJobStatus, NodeStatus
 from app.schemas import (
+    AgentGcReport,
     AgentJobOut,
+    AgentJobProgress,
     AgentJobResult,
     NodeCreate,
     NodeEnrollmentOut,
@@ -31,6 +33,15 @@ router = APIRouter(prefix="/nodes", tags=["Cloud nodes"])
 agent = APIRouter(prefix="/agent/nodes", tags=["Node agent"])
 agent_files = APIRouter(prefix="/agent", tags=["Node agent"])
 REQUIRED_COMPUTE_CAPABILITIES = {"jobs", "vagrant", "libvirt", "kvm"}
+
+
+def job_lease_seconds(job_type: str) -> int:
+    # Snapshot jobs renew continuously while healthy. A short lease prevents
+    # an agent restart from leaving the customer UI stuck for the general
+    # 20-minute job lease before the abandoned conversion is noticed.
+    if job_type in {"REPLICA_CAPTURE", "REPLICA_DOWNLOAD", "REPLICA_DELETE"}:
+        return min(settings.node_job_lease_seconds, 90)
+    return settings.node_job_lease_seconds
 
 
 def observed_status(node: CloudNode, now: datetime | None = None) -> NodeStatus:
@@ -219,6 +230,61 @@ async def heartbeat(
     return output(CloudNode.model_validate({**node.model_dump(), **changes}))
 
 
+@agent.get("/{node_id}/inventory")
+async def node_inventory(
+    node_id: UUID,
+    database: Database,
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
+    node = await authenticated_node(database, node_id, authorization)
+    instances = await database.instances.find(
+        {"node_id": str(node.id), "deleted_at": None}, {"multipass_name": 1}
+    ).to_list(None)
+    volumes = await database.volumes.find(
+        {"node_id": str(node.id)}, {"_id": 1}
+    ).to_list(None)
+    recovery_points = await database.recovery_points.find(
+        {
+            "$or": [
+                {"replica_node_ids": str(node.id)},
+                {"source_node_id": str(node.id), "status": "CREATING"},
+            ]
+        },
+        {"_id": 1},
+    ).to_list(None)
+    amis = await database.amis.find(
+        {"status": {"$in": ["CREATING", "AVAILABLE"]}}, {"_id": 1}
+    ).to_list(None)
+    return {
+        "generated_at": datetime.now(UTC),
+        "instance_names": [str(item["multipass_name"]) for item in instances],
+        "volume_ids": [str(item["_id"]) for item in volumes],
+        "recovery_point_ids": [str(item["_id"]) for item in recovery_points],
+        "ami_ids": [str(item["_id"]) for item in amis],
+    }
+
+
+@agent.post("/{node_id}/gc-report", status_code=204)
+async def report_garbage_collection(
+    node_id: UUID,
+    data: AgentGcReport,
+    database: Database,
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    node = await authenticated_node(database, node_id, authorization)
+    await database.cloud_nodes.update_one(
+        {"_id": str(node.id)},
+        {"$set": {
+            "last_gc_at": datetime.now(UTC),
+            "last_gc_status": data.status,
+            "last_gc_removed": data.removed,
+            "last_gc_reclaimed_bytes": data.reclaimed_bytes,
+            "last_gc_error": data.error,
+            "updated_at": datetime.now(UTC),
+        }},
+    )
+
+
 @agent.post("/{node_id}/jobs/claim", response_model=AgentJobOut, responses={204: {}})
 async def claim_job(
     node_id: UUID,
@@ -255,10 +321,17 @@ async def renew_job(
     node_id: UUID,
     job_id: UUID,
     database: Database,
+    data: AgentJobProgress | None = None,
     authorization: Annotated[str | None, Header()] = None,
 ) -> None:
     node = await authenticated_node(database, node_id, authorization)
     now = datetime.now(UTC)
+    leased = await database.node_jobs.find_one(
+        {"_id": str(job_id), "node_id": str(node.id), "status": NodeJobStatus.LEASED},
+        {"job_type": 1, "payload": 1},
+    )
+    if not leased:
+        raise HTTPException(409, "Node job lease is no longer active")
     result = await database.node_jobs.update_one(
         {
             "_id": str(job_id),
@@ -267,13 +340,37 @@ async def renew_job(
         },
         {
             "$set": {
-                "lease_expires_at": now + timedelta(seconds=settings.node_job_lease_seconds),
+                "lease_expires_at": now
+                + timedelta(seconds=job_lease_seconds(str(leased.get("job_type") or ""))),
                 "updated_at": now,
+                **(
+                    {"progress": data.progress, "progress_message": data.message}
+                    if data
+                    else {}
+                ),
             }
         },
     )
     if not result.modified_count:
         raise HTTPException(409, "Node job lease is no longer active")
+    if data and leased.get("job_type") in {"REPLICA_CAPTURE", "REPLICA_DOWNLOAD"}:
+        point_id = str((leased.get("payload") or {}).get("recovery_point_id") or "")
+        if point_id:
+            is_copy = leased.get("job_type") == "REPLICA_DOWNLOAD"
+            progress = 90 + int(data.progress * 9 / 100) if is_copy else min(89, data.progress)
+            message = (
+                f"Copying ({data.progress}%) snapshot to {node.name}"
+                if is_copy
+                else data.message
+            )
+            await database.recovery_points.update_one(
+                {"_id": point_id, "status": "CREATING"},
+                {"$set": {
+                    "progress": progress,
+                    "progress_message": message,
+                    "updated_at": now,
+                }},
+            )
 
 
 @agent.post("/{node_id}/jobs/{job_id}/complete", status_code=204)
@@ -352,6 +449,72 @@ def ami_storage_path(ami_id: UUID) -> Path:
     root = Path(settings.ami_storage_root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root / f"{ami_id}.box"
+
+
+def recovery_storage_path(recovery_point_id: UUID) -> Path:
+    root = Path(settings.recovery_storage_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"{recovery_point_id}.qcow2"
+
+
+@agent_files.get(
+    "/nodes/{node_id}/recovery-points/{recovery_point_id}",
+    response_class=FileResponse,
+    include_in_schema=False,
+)
+async def download_recovery_point(
+    node_id: UUID,
+    recovery_point_id: UUID,
+    database: Database,
+    authorization: Annotated[str | None, Header()] = None,
+) -> FileResponse:
+    await authenticated_node(database, node_id, authorization)
+    point = await database.recovery_points.find_one({"_id": str(recovery_point_id)})
+    if not point or point.get("status") not in {"CREATING", "AVAILABLE"}:
+        raise HTTPException(404, "Recovery point not found")
+    path = recovery_storage_path(recovery_point_id)
+    if not path.is_file():
+        raise HTTPException(404, "Recovery point data is unavailable")
+    return FileResponse(path, media_type="application/octet-stream", filename=path.name)
+
+
+@agent_files.put(
+    "/nodes/{node_id}/recovery-points/{recovery_point_id}",
+    status_code=204,
+    include_in_schema=False,
+)
+async def upload_recovery_point(
+    node_id: UUID,
+    recovery_point_id: UUID,
+    request: Request,
+    database: Database,
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    await authenticated_node(database, node_id, authorization)
+    point = await database.recovery_points.find_one(
+        {"_id": str(recovery_point_id), "source_node_id": str(node_id), "status": "CREATING"}
+    )
+    if not point:
+        raise HTTPException(404, "Recovery point capture is not assigned to this node")
+    instance = await database.instances.find_one({"_id": point["instance_id"]})
+    if not instance:
+        raise HTTPException(404, "Recovery point instance no longer exists")
+    path = recovery_storage_path(recovery_point_id)
+    temporary = path.with_suffix(".uploading")
+    written = 0
+    maximum = (int(instance["disk_gb"]) * 1024**3) + 1024**3
+    try:
+        with temporary.open("wb") as target:
+            async for chunk in request.stream():
+                written += len(chunk)
+                if written > maximum:
+                    raise HTTPException(413, "Recovery point exceeds instance disk capacity")
+                target.write(chunk)
+        if not written:
+            raise HTTPException(400, "Uploaded recovery point is empty")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @agent_files.get(

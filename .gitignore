@@ -21,3 +21,4 @@ runtime/
 .vscode/
 Thumbs.db
 .DS_Store
+backend/data/recovery-points/

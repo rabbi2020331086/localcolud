@@ -101,3 +101,36 @@ select:disabled,input:disabled,textarea:disabled{cursor:not-allowed;color:#536b7
 .template-form-section h3{margin:0 0 6px}.template-form-section>div>p{margin:0;color:var(--color-text-muted);font-size:13px}
 @media(max-width:1000px){.template-card-grid{grid-template-columns:1fr}.template-form-section{grid-template-columns:1fr}.template-specs{grid-template-columns:1fr}}
 @media(max-width:600px){.template-meta{grid-template-columns:1fr}.template-card-head{grid-template-columns:42px 1fr}.template-card-actions{grid-column:2}.template-editor-card>form{padding:17px}}
+.page-error {
+  max-width: 720px;
+  margin: 48px auto;
+  padding: 28px;
+  border: 1px solid #fecaca;
+  border-radius: 14px;
+  background: #fff7f7;
+  color: #991b1b;
+}
+
+.page-error h1 {
+  margin: 0 0 8px;
+  color: #7f1d1d;
+}
+
+.page-error p {
+  margin: 0 0 20px;
+}
+.replication-user-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1rem;
+  align-items: end;
+  margin: 1rem 0 1.5rem;
+}
+.replication-user-form .check,
+.replication-user-form .instance-action-buttons { grid-column: 1 / -1; }
+.snapshot-progress-banner { display: grid; gap: .8rem; margin-bottom: 1rem; }
+.snapshot-progress-banner > div { display: flex; align-items: center; gap: .75rem; }
+.snapshot-progress-banner span { display: grid; gap: .2rem; }
+.snapshot-progress-banner progress { width: 100%; height: .75rem; }
+.snapshot-row-actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+.snapshot-row-actions .button { padding: .55rem .75rem; font-size: .8rem; }

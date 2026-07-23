@@ -1,8 +1,10 @@
 import shlex
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from pathlib import Path
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 
 from app.api.dependencies import CurrentUser
 from app.core.config import settings
@@ -18,10 +20,17 @@ from app.infrastructure.models import (
     Operation,
     OperationStatus,
     OperationType,
+    RecoveryPoint,
 )
 from app.infrastructure.vm import safe_name
-from app.schemas import AcceptedOut, InstanceCreate, InstanceOut, ZoneCapacityOut
-from app.services import node_jobs, scheduler
+from app.schemas import (
+    AcceptedOut,
+    InstanceCreate,
+    InstanceOut,
+    ReplicationPolicyIn,
+    ZoneCapacityOut,
+)
+from app.services import node_jobs, replication, scheduler
 from app.services.operations import key_pair
 
 router = APIRouter(prefix="/instances", tags=["Instances"])
@@ -81,6 +90,146 @@ async def list_instances(user: CurrentUser, database: Database) -> list[Instance
 @router.get("/capacity/zones", response_model=list[ZoneCapacityOut])
 async def capacity_zones(user: CurrentUser, database: Database) -> list[ZoneCapacityOut]:
     return await scheduler.zone_capacity(database)
+
+
+@router.get("/{instance_id}/replication")
+async def get_replication(
+    instance_id: UUID, user: CurrentUser, database: Database
+) -> dict[str, object]:
+    item = await owned(database, user.id, instance_id)
+    policy = await replication.policy_for(item)
+    points = from_documents(
+        RecoveryPoint,
+        await database.recovery_points.find({"instance_id": str(item.id)})
+        .sort("created_at", -1)
+        .to_list(None),
+    )
+    node_rows = {
+        str(row["_id"]): row for row in await database.cloud_nodes.find({}).to_list(None)
+    }
+    deadline = datetime.now(UTC) - timedelta(seconds=settings.node_offline_seconds)
+    output_points: list[dict[str, object]] = []
+    for point in points:
+        source = node_rows.get(str(point.source_node_id))
+        offline = bool(
+            not source
+            or not source.get("last_seen_at")
+            or source["last_seen_at"] < deadline
+        )
+        output_points.append(
+            {
+                **point.model_dump(mode="json"),
+                "progress_message": (
+                    "Source laptop is offline; waiting to retry"
+                    if point.status.value == "CREATING" and offline
+                    else point.progress_message
+                ),
+                "source_node": (
+                    str(source.get("name") or "Unknown node") if source else None
+                ),
+                "replica_nodes": [
+                    str(node_rows[str(node_id)].get("name") or "Unknown node")
+                    for node_id in point.replica_node_ids
+                    if str(node_id) in node_rows
+                ],
+            }
+        )
+    return {
+        "policy": policy.model_dump(mode="json"),
+        "points": output_points,
+    }
+
+
+@router.put("/{instance_id}/replication/policy")
+async def set_replication_policy(
+    instance_id: UUID,
+    data: ReplicationPolicyIn,
+    user: CurrentUser,
+    database: Database,
+) -> dict[str, object]:
+    item = await owned(database, user.id, instance_id)
+    now = datetime.now(UTC)
+    changes = {**data.model_dump(), "updated_by": str(user.id), "updated_at": now}
+    await database.replication_policies.update_one(
+        {"instance_id": str(item.id), "user_id": str(user.id)},
+        {
+            "$set": changes,
+            "$setOnInsert": {
+                "_id": str(uuid4()),
+                "user_id": str(user.id),
+                "instance_id": str(item.id),
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+    return {**changes, "user_id": str(user.id), "instance_id": str(item.id)}
+
+
+@router.post("/{instance_id}/recovery-points", status_code=201)
+async def create_recovery_point(
+    instance_id: UUID, user: CurrentUser, database: Database
+) -> dict[str, object]:
+    item = await owned(database, user.id, instance_id)
+    if await database.operations.find_one(
+        {"instance_id": str(item.id), "status": {"$in": ["PENDING", "RUNNING"]}}
+    ):
+        raise HTTPException(409, "Another instance operation is active")
+    try:
+        point = await replication.capture(item, requested_by=user.id)
+    except Exception as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return point.model_dump(mode="json")
+
+
+@router.delete("/{instance_id}/recovery-points/{recovery_point_id}", status_code=204)
+async def delete_recovery_point(
+    instance_id: UUID,
+    recovery_point_id: UUID,
+    user: CurrentUser,
+    database: Database,
+) -> None:
+    item = await owned(database, user.id, instance_id)
+    point = from_document(
+        RecoveryPoint,
+        await database.recovery_points.find_one(
+            {"_id": str(recovery_point_id), "instance_id": str(item.id)}
+        ),
+    )
+    if not point:
+        raise HTTPException(404, "Recovery point not found")
+    if point.status.value == "CREATING":
+        raise HTTPException(409, "A recovery point cannot be deleted while it is being created")
+    await replication.remove_point(point)
+
+
+@router.get("/{instance_id}/recovery-points/{recovery_point_id}/download")
+async def download_recovery_point(
+    instance_id: UUID,
+    recovery_point_id: UUID,
+    user: CurrentUser,
+    database: Database,
+) -> FileResponse:
+    item = await owned(database, user.id, instance_id)
+    point = from_document(
+        RecoveryPoint,
+        await database.recovery_points.find_one(
+            {
+                "_id": str(recovery_point_id),
+                "instance_id": str(item.id),
+                "status": "AVAILABLE",
+                "canonical_present": True,
+            }
+        ),
+    )
+    path = Path(settings.recovery_storage_root).expanduser().resolve() / f"{recovery_point_id}.qcow2"
+    if not point or not path.is_file():
+        raise HTTPException(404, "Downloadable recovery point not found")
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        filename=f"{item.display_name}-{recovery_point_id}.qcow2",
+    )
 
 
 @router.post("", response_model=AcceptedOut, status_code=202)

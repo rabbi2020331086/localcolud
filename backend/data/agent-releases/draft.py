@@ -8,11 +8,13 @@ import argparse
 import asyncio
 import base64
 import fcntl
+import hashlib
 import json
 import os
 import platform
 import pty
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -28,8 +30,8 @@ import psutil
 from websockets.asyncio.client import connect
 from websockets.typing import Subprotocol
 
-AGENT_VERSION = "0.5.12"
-# AUTO-GENERATED COMPATIBILITY MARKER: "agent_version": "0.5.12"
+AGENT_VERSION = "0.7.1"
+# AUTO-GENERATED COMPATIBILITY MARKER: "agent_version": "0.7.1"
 
 
 def version_from_source(source: bytes) -> str | None:
@@ -40,7 +42,7 @@ def version_from_source(source: bytes) -> str | None:
 
 
 def vagrant_capabilities() -> tuple[str, list[str]]:
-    capabilities = ["heartbeat", "capacity", "jobs", "volume-create"]
+    capabilities = ["heartbeat", "capacity", "jobs", "volume-create", "orphan-gc"]
     executable = os.environ.get("VAGRANT_EXECUTABLE", "vagrant")
 
     # Keep the probes independent. A slow `vagrant plugin list` must not hide
@@ -181,6 +183,52 @@ class NodeExecutor:
             900, int(os.environ.get("LOCAL_EC2_LAUNCH_TIMEOUT_SECONDS", "1800"))
         )
         self.root.mkdir(parents=True, exist_ok=True)
+        self.progress: dict[str, tuple[int, str]] = {}
+        self.orphan_first_seen: dict[str, float] = {}
+
+    def report_progress(self, job_id: str, progress: int, message: str) -> None:
+        if job_id:
+            self.progress[job_id] = (max(0, min(100, progress)), message[:200])
+
+    def run_conversion_with_progress(
+        self, command: list[str], job_id: str
+    ) -> tuple[int, str]:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+        output = bytearray()
+        last_percent = -1
+        started = time.monotonic()
+        assert process.stdout is not None
+        while True:
+            ready, _, _ = select.select([process.stdout], [], [], 1.0)
+            value = os.read(process.stdout.fileno(), 4096) if ready else b""
+            if value:
+                output.extend(value)
+                if len(output) > 8000:
+                    del output[:-4000]
+                matches = re.findall(rb"\(([0-9]+(?:\.[0-9]+)?)/100%\)", output[-160:])
+                if matches:
+                    percent = max(0, min(100, int(float(matches[-1]))))
+                    if percent != last_percent:
+                        last_percent = percent
+                        self.report_progress(
+                            job_id,
+                            10 + int(45 * percent / 100),
+                            f"Compressing root disk ({percent}%)",
+                        )
+            elif process.poll() is not None:
+                break
+            if time.monotonic() - started > self.launch_timeout:
+                process.kill()
+                process.wait()
+                raise RuntimeError(
+                    f"Root-disk conversion timed out after {self.launch_timeout} seconds"
+                )
+        return process.wait(), output.decode(errors="replace")
 
     def instance_root(self, name: str) -> Path:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
@@ -355,6 +403,54 @@ class NodeExecutor:
         node_id = os.environ.get("LOCAL_EC2_NODE_ID", "")
         return f"{base_url}/agent/nodes/{node_id}/amis/{ami_id}"
 
+    def recovery_url(self, recovery_point_id: str) -> str:
+        base_url = os.environ.get("LOCAL_EC2_API_URL", "").rstrip("/")
+        node_id = os.environ.get("LOCAL_EC2_NODE_ID", "")
+        return f"{base_url}/agent/nodes/{node_id}/recovery-points/{recovery_point_id}"
+
+    def domain_root_disk(self, name: str) -> Path:
+        result = subprocess.run(
+            ["virsh", "--connect", "qemu:///system", "domblklist", f"{name}_default", "--details"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(result.stderr or "Could not inspect the VM root disk")
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if (
+                len(fields) >= 4
+                and fields[0] == "file"
+                and fields[1] == "disk"
+                and fields[2] == "vda"
+            ):
+                path = Path(" ".join(fields[3:])).resolve()
+                if not path.is_file():
+                    raise RuntimeError("The VM root disk is missing")
+                return path
+        raise RuntimeError("The VM root disk could not be identified")
+
+    @staticmethod
+    def snapshot_convert_command(disk: Path, snapshot: Path) -> list[str]:
+        # The VM is suspended before this command. QEMU still owns its write
+        # lock, so -U is required for a concurrent read-only source open.
+        return [
+            "sudo",
+            "-n",
+            "qemu-img",
+            "convert",
+            "-U",
+            "-c",
+            "-m",
+            "2",
+            "-p",
+            "-O",
+            "qcow2",
+            str(disk),
+            str(snapshot),
+        ]
+
     def volume_headers(self) -> dict[str, str]:
         token = os.environ.get("LOCAL_EC2_NODE_TOKEN", "")
         return {"Authorization": f"Bearer {token}"}
@@ -485,10 +581,349 @@ class NodeExecutor:
                 pass
         return {"name": name, "state": state, "ipv4_address": ipv4}
 
+    def capture_recovery_point(
+        self, name: str, point_id: str, job_id: str
+    ) -> dict[str, object]:
+        self.report_progress(job_id, 5, "Inspecting the VM root disk")
+        disk = self.domain_root_disk(name)
+        domain = f"{name}_default"
+        state = subprocess.run(
+            ["virsh", "--connect", "qemu:///system", "domstate", domain],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.lower()
+        was_running = "running" in state
+        was_interrupted_pause = "paused" in state
+        directory = self.root.parent / "recovery-points"
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        snapshot = directory / f"{point_id}.qcow2"
+        snapshot.unlink(missing_ok=True)
+        paused = False
+        paused_at: float | None = None
+        pause_seconds = 0.0
+        try:
+            if was_interrupted_pause:
+                # A previous capture can be interrupted after libvirt suspend
+                # but before its finally block resumes the domain. Treat that
+                # state as ours and guarantee resume after this retry.
+                paused = True
+                paused_at = time.monotonic()
+                self.report_progress(job_id, 8, "Recovering an interrupted snapshot attempt")
+            elif was_running:
+                result = subprocess.run(
+                    ["virsh", "--connect", "qemu:///system", "suspend", domain],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode:
+                    raise RuntimeError(result.stderr or "Could not pause VM for backup")
+                paused = True
+                paused_at = time.monotonic()
+            self.report_progress(job_id, 10, "Converting the root disk to compressed qcow2")
+            returncode, conversion_output = self.run_conversion_with_progress(
+                self.snapshot_convert_command(disk, snapshot), job_id
+            )
+            if returncode:
+                raise RuntimeError(conversion_output or "Could not create root-disk snapshot")
+            ownership = subprocess.run(
+                ["sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", str(snapshot)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if ownership.returncode:
+                raise RuntimeError(ownership.stderr or "Could not read the completed snapshot")
+        finally:
+            if paused:
+                subprocess.run(
+                    ["virsh", "--connect", "qemu:///system", "resume", domain],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if paused_at is not None:
+                    pause_seconds = time.monotonic() - paused_at
+        try:
+            digest = hashlib.sha256()
+            size = snapshot.stat().st_size
+            hashed = 0
+            with snapshot.open("rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+                    hashed += len(block)
+                    self.report_progress(
+                        job_id,
+                        55 + int(15 * hashed / max(1, size)),
+                        f"Verifying snapshot integrity ({hashed * 100 // max(1, size)}%)",
+                    )
+            uploaded = 0
+
+            def upload_blocks() -> Any:
+                nonlocal uploaded
+                with snapshot.open("rb") as source:
+                    for block in iter(lambda: source.read(1024 * 1024), b""):
+                        uploaded += len(block)
+                        self.report_progress(
+                            job_id,
+                            70 + int(19 * uploaded / max(1, size)),
+                            f"Uploading snapshot ({uploaded * 100 // max(1, size)}%)",
+                        )
+                        yield block
+
+            with (
+                httpx.Client(headers=self.volume_headers(), timeout=1800) as client,
+            ):
+                response = client.put(self.recovery_url(point_id), content=upload_blocks())
+                response.raise_for_status()
+            self.report_progress(job_id, 89, "Canonical snapshot uploaded")
+            return {
+                "size_bytes": size,
+                "sha256": digest.hexdigest(),
+                "paused": was_running or was_interrupted_pause,
+                "pause_seconds": round(pause_seconds, 3),
+            }
+        finally:
+            snapshot.unlink(missing_ok=True)
+
+    def download_recovery_point(self, point_id: str, job_id: str = "") -> Path:
+        directory = self.root.parent / "recovery-points"
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target = directory / f"{point_id}.qcow2"
+        temporary = target.with_suffix(".downloading")
+        with httpx.Client(headers=self.volume_headers(), timeout=1800) as client:
+            with client.stream("GET", self.recovery_url(point_id)) as response:
+                response.raise_for_status()
+                total = int(response.headers.get("content-length") or 0)
+                downloaded = 0
+                with temporary.open("wb") as output:
+                    for chunk in response.iter_bytes():
+                        output.write(chunk)
+                        downloaded += len(chunk)
+                        percent = min(100, int(downloaded * 100 / total)) if total else 0
+                        self.report_progress(job_id, percent, f"Copying snapshot ({percent}%)")
+        self.report_progress(job_id, 100, "Copying snapshot (100%)")
+        os.replace(temporary, target)
+        return target
+
+    def garbage_collect(
+        self, inventory: dict[str, Any], grace_seconds: int
+    ) -> dict[str, object]:
+        """Remove only LocalEC2-owned resources absent from an authenticated manifest."""
+        desired_instances = {
+            value for value in inventory.get("instance_names", [])
+            if isinstance(value, str) and re.fullmatch(r"localec2-[A-Za-z0-9_.-]+", value)
+        }
+        desired_volumes = {
+            value for value in inventory.get("volume_ids", [])
+            if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", value)
+        }
+        desired_points = {
+            value for value in inventory.get("recovery_point_ids", [])
+            if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", value)
+        }
+        desired_amis = {
+            value for value in inventory.get("ami_ids", [])
+            if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", value)
+        }
+        now = time.monotonic()
+        removed = {"domains": 0, "workspaces": 0, "snapshots": 0, "volumes": 0, "amis": 0}
+        reclaimed = 0
+
+        def ready(key: str) -> bool:
+            first = self.orphan_first_seen.setdefault(key, now)
+            return now - first >= grace_seconds
+
+        def retained(key: str) -> None:
+            self.orphan_first_seen.pop(key, None)
+
+        domains = subprocess.run(
+            ["virsh", "--connect", "qemu:///system", "list", "--all", "--name"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if domains.returncode:
+            raise RuntimeError(domains.stderr or "Could not inventory libvirt domains")
+        for domain in domains.stdout.splitlines():
+            domain = domain.strip()
+            if not domain.startswith("localec2-") or not domain.endswith("_default"):
+                continue
+            name = domain.removesuffix("_default")
+            key = f"domain:{domain}"
+            if name in desired_instances:
+                retained(key)
+            elif ready(key):
+                self.destroy_orphan_domain(name)
+                removed["domains"] += 1
+                retained(key)
+
+        if self.root.is_dir():
+            for workspace in self.root.iterdir():
+                if not workspace.is_dir() or not workspace.name.startswith("localec2-"):
+                    continue
+                key = f"workspace:{workspace.name}"
+                if workspace.name in desired_instances:
+                    retained(key)
+                elif ready(key):
+                    reclaimed += sum(
+                        item.stat().st_size
+                        for item in workspace.rglob("*")
+                        if item.is_file()
+                    )
+                    shutil.rmtree(workspace)
+                    removed["workspaces"] += 1
+                    retained(key)
+
+        file_groups = (
+            (self.root.parent / "recovery-points", desired_points, "snapshots"),
+            (self.root.parent / "volumes", desired_volumes, "volumes"),
+        )
+        for directory, desired, category in file_groups:
+            if not directory.is_dir():
+                continue
+            for image in directory.glob("*.qcow2"):
+                resource_id = image.stem
+                if not re.fullmatch(r"[0-9a-fA-F-]{36}", resource_id):
+                    continue
+                key = f"{category}:{resource_id}"
+                if resource_id in desired:
+                    retained(key)
+                elif ready(key):
+                    reclaimed += image.stat().st_size
+                    image.unlink(missing_ok=True)
+                    removed[category] += 1
+                    retained(key)
+
+        for package in self.root.parent.glob("ami-*.box"):
+            ami_id = package.stem.removeprefix("ami-")
+            if not re.fullmatch(r"[0-9a-fA-F-]{36}", ami_id):
+                continue
+            key = f"ami-package:{ami_id}"
+            if ami_id in desired_amis:
+                retained(key)
+            elif ready(key):
+                reclaimed += package.stat().st_size
+                package.unlink(missing_ok=True)
+                removed["amis"] += 1
+                retained(key)
+
+        boxes = subprocess.run(
+            [self.executable, "box", "list"], capture_output=True, text=True, check=False
+        )
+        if boxes.returncode == 0:
+            for match in re.finditer(
+                r"^localec2/ami-([0-9a-fA-F-]{36})\s", boxes.stdout, re.MULTILINE
+            ):
+                ami_id = match.group(1)
+                key = f"ami-box:{ami_id}"
+                if ami_id in desired_amis:
+                    retained(key)
+                elif ready(key):
+                    result = subprocess.run(
+                        [
+                            self.executable, "box", "remove", "-f",
+                            f"localec2/ami-{ami_id}", "--provider", self.provider,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if result.returncode:
+                        raise RuntimeError(result.stderr or "Could not remove orphan AMI box")
+                    removed["amis"] += 1
+                    retained(key)
+        return {"removed": removed, "reclaimed_bytes": reclaimed}
+
     def execute(self, job: dict[str, Any]) -> dict[str, object]:
         kind = str(job["job_type"])
+        job_id = str(job.get("id") or "")
         payload = dict(job.get("payload") or {})
         name = str(payload.get("name") or "")
+        if kind in {"REPLICA_CAPTURE", "REPLICA_DOWNLOAD", "REPLICA_DELETE", "RECOVER"}:
+            point_id = str(payload.get("recovery_point_id") or "")
+            if not re.fullmatch(r"[0-9a-fA-F-]{36}", point_id):
+                raise RuntimeError("Invalid recovery point identity")
+            if kind == "REPLICA_CAPTURE":
+                return self.capture_recovery_point(name, point_id, job_id)
+            if kind == "REPLICA_DOWNLOAD":
+                target = self.download_recovery_point(point_id, job_id)
+                expected = str(payload.get("sha256") or "")
+                if expected:
+                    digest = hashlib.sha256()
+                    with target.open("rb") as source:
+                        for block in iter(lambda: source.read(1024 * 1024), b""):
+                            digest.update(block)
+                    if digest.hexdigest() != expected:
+                        target.unlink(missing_ok=True)
+                        raise RuntimeError("Downloaded recovery point checksum does not match")
+                return {"stored": True, "size_bytes": target.stat().st_size}
+            if kind == "REPLICA_DELETE":
+                (self.root.parent / "recovery-points" / f"{point_id}.qcow2").unlink(missing_ok=True)
+                return {"deleted": True}
+            replica = self.root.parent / "recovery-points" / f"{point_id}.qcow2"
+            if not replica.is_file():
+                replica = self.download_recovery_point(point_id)
+            launch_payload = {
+                key: value for key, value in payload.items() if key != "recovery_point_id"
+            }
+            self.execute({"job_type": "LAUNCH", "payload": launch_payload})
+            root = self.instance_root(name)
+            self.run(root, "halt", timeout=300)
+            disk = self.domain_root_disk(name)
+            replacement = disk.with_suffix(".recovered")
+            disk_stat = disk.stat()
+            converted = subprocess.run(
+                [
+                    "sudo",
+                    "-n",
+                    "qemu-img",
+                    "convert",
+                    "-p",
+                    "-O",
+                    "qcow2",
+                    str(replica),
+                    str(replacement),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self.launch_timeout,
+                check=False,
+            )
+            if converted.returncode:
+                subprocess.run(["sudo", "-n", "rm", "-f", str(replacement)], check=False)
+                raise RuntimeError(converted.stderr or "Could not restore the root disk")
+            installed = subprocess.run(
+                [
+                    "sudo",
+                    "-n",
+                    "chown",
+                    f"{disk_stat.st_uid}:{disk_stat.st_gid}",
+                    str(replacement),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if not installed.returncode:
+                installed = subprocess.run(
+                    ["sudo", "-n", "chmod", oct(disk_stat.st_mode & 0o777), str(replacement)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            if not installed.returncode:
+                installed = subprocess.run(
+                    ["sudo", "-n", "mv", "-f", str(replacement), str(disk)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            if installed.returncode:
+                raise RuntimeError(installed.stderr or "Could not install the recovered root disk")
+            self.run(root, "up", f"--provider={self.provider}", timeout=self.launch_timeout)
+            return self.inspect(name)
         if kind == "HOST_EXEC":
             command = str(payload.get("command") or "")
             timeout = min(600, max(1, int(payload.get("timeout") or 60)))
@@ -499,13 +934,14 @@ class NodeExecutor:
                 r"(^|[\s;&|`()])(?:/[^\s;&|`]*/)?(?:sudo|su|pkexec|doas)(?=$|[\s;&|`(])",
                 command,
             ):
-                raise RuntimeError(
-                    "Privilege escalation requires enabling Run as root (sudo)"
-                )
+                raise RuntimeError("Privilege escalation requires enabling Run as root (sudo)")
             try:
                 completed = subprocess.run(
-                    (["sudo", "-n", "/bin/bash", "-lc", command]
-                     if run_as_root else ["/bin/bash", "-lc", command]),
+                    (
+                        ["sudo", "-n", "/bin/bash", "-lc", command]
+                        if run_as_root
+                        else ["/bin/bash", "-lc", command]
+                    ),
                     capture_output=True,
                     text=True,
                     timeout=timeout,
@@ -529,9 +965,7 @@ class NodeExecutor:
             with httpx.Client(timeout=120) as client:
                 agent_response = client.get(f"{control_plane}/agent/agent.py")
                 agent_response.raise_for_status()
-                service_response = client.get(
-                    f"{control_plane}/agent/localec2-agent.service"
-                )
+                service_response = client.get(f"{control_plane}/agent/localec2-agent.service")
                 service_response.raise_for_status()
             agent_file.write_bytes(agent_response.content)
             service_file.write_bytes(service_response.content)
@@ -540,8 +974,17 @@ class NodeExecutor:
                 raise RuntimeError("Downloaded agent does not contain version metadata")
             installed = subprocess.run(
                 [
-                    "sudo", "-n", "install", "-o", "root", "-g", "root", "-m", "0755",
-                    str(agent_file), "/opt/localec2-agent/agent.py",
+                    "sudo",
+                    "-n",
+                    "install",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "-m",
+                    "0755",
+                    str(agent_file),
+                    "/opt/localec2-agent/agent.py",
                 ],
                 capture_output=True,
                 text=True,
@@ -551,8 +994,17 @@ class NodeExecutor:
                 raise RuntimeError(installed.stderr or "Could not install updated agent")
             installed_service = subprocess.run(
                 [
-                    "sudo", "-n", "install", "-o", "root", "-g", "root", "-m", "0644",
-                    str(service_file), "/etc/systemd/system/localec2-agent.service",
+                    "sudo",
+                    "-n",
+                    "install",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "-m",
+                    "0644",
+                    str(service_file),
+                    "/etc/systemd/system/localec2-agent.service",
                 ],
                 capture_output=True,
                 text=True,
@@ -564,13 +1016,19 @@ class NodeExecutor:
                 )
             # The transient root unit survives this agent process and restarts
             # it only after execute_with_heartbeats has reported job completion.
-            update_unit = "localec2-agent-update-" + re.sub(
-                r"[^a-zA-Z0-9]", "", str(job.get("id") or "update")
-            )[:24]
+            update_unit = (
+                "localec2-agent-update-"
+                + re.sub(r"[^a-zA-Z0-9]", "", str(job.get("id") or "update"))[:24]
+            )
             scheduled = subprocess.run(
                 [
-                    "sudo", "-n", "systemd-run", f"--unit={update_unit}",
-                    "--on-active=10s", "/bin/sh", "-c",
+                    "sudo",
+                    "-n",
+                    "systemd-run",
+                    f"--unit={update_unit}",
+                    "--on-active=10s",
+                    "/bin/sh",
+                    "-c",
                     "systemctl daemon-reload && systemctl restart localec2-agent",
                 ],
                 capture_output=True,
@@ -607,7 +1065,9 @@ class NodeExecutor:
             box_name = f"localec2/ami-{ami_id}"
             subprocess.run(
                 [self.executable, "box", "remove", "-f", box_name, "--provider", self.provider],
-                capture_output=True, text=True, check=False,
+                capture_output=True,
+                text=True,
+                check=False,
             )
             return {"deleted": True}
         if kind == "LAUNCH":
@@ -630,8 +1090,13 @@ class NodeExecutor:
                     try:
                         added = subprocess.run(
                             [
-                                self.executable, "box", "add", "--force", "--name",
-                                box_name, str(package),
+                                self.executable,
+                                "box",
+                                "add",
+                                "--force",
+                                "--name",
+                                box_name,
+                                str(package),
                             ],
                             capture_output=True,
                             text=True,
@@ -1144,9 +1609,20 @@ async def complete_job(
             await asyncio.sleep(2**attempt)
 
 
-async def renew_job(client: httpx.AsyncClient, base_url: str, node_id: str, job_id: str) -> None:
+async def renew_job(
+    client: httpx.AsyncClient,
+    base_url: str,
+    node_id: str,
+    job_id: str,
+    progress: tuple[int, str] | None = None,
+) -> None:
     response = await client.post(
-        f"{base_url.rstrip('/')}/agent/nodes/{node_id}/jobs/{job_id}/renew"
+        f"{base_url.rstrip('/')}/agent/nodes/{node_id}/jobs/{job_id}/renew",
+        json=(
+            {"progress": progress[0], "message": progress[1]}
+            if progress
+            else None
+        ),
     )
     response.raise_for_status()
 
@@ -1166,11 +1642,20 @@ async def execute_with_heartbeats(
             break
         try:
             await send_heartbeat(client, base_url, node_id)
-            await renew_job(client, base_url, node_id, str(job["id"]))
+            await renew_job(
+                client,
+                base_url,
+                node_id,
+                str(job["id"]),
+                executor.progress.get(str(job["id"])),
+            )
         except httpx.HTTPError:
             # VM execution must not be cancelled by a transient heartbeat error.
             pass
-    return await execution
+    try:
+        return await execution
+    finally:
+        executor.progress.pop(str(job["id"]), None)
 
 
 async def run(interval: float, once: bool) -> None:
@@ -1188,8 +1673,13 @@ async def run(interval: float, once: bool) -> None:
         60, int(os.environ.get("LOCAL_EC2_AUTO_UPDATE_INTERVAL_SECONDS", "300"))
     )
     auto_update_enabled = os.environ.get("LOCAL_EC2_AUTO_UPDATE", "true").lower() not in {
-        "0", "false", "no", "off",
+        "0",
+        "false",
+        "no",
+        "off",
     }
+    gc_interval = max(60, int(os.environ.get("LOCAL_EC2_GC_INTERVAL_SECONDS", "300")))
+    gc_grace = max(300, int(os.environ.get("LOCAL_EC2_GC_GRACE_SECONDS", "3600")))
 
     async def terminal_loop() -> None:
         delay_seconds = 2
@@ -1232,7 +1722,7 @@ async def run(interval: float, once: bool) -> None:
                     delay_seconds = 1.0
                     try:
                         result = await execute_with_heartbeats(
-                            executor, job, client, base_url, node_id, interval
+                            executor, job, client, base_url, node_id, min(interval, 1.0)
                         )
                         await complete_job(client, base_url, node_id, str(job["id"]), True, result)
                     except Exception as exc:
@@ -1277,9 +1767,45 @@ async def run(interval: float, once: bool) -> None:
                     retry_seconds = min(max(60.0, retry_seconds * 2), 3600.0)
                 await asyncio.sleep(retry_seconds)
 
+        async def garbage_collection_loop() -> None:
+            # Never collect from cached state: every pass requires a fresh,
+            # authenticated control-plane inventory.
+            await asyncio.sleep(min(30, gc_interval))
+            while True:
+                try:
+                    response = await client.get(
+                        f"{base_url.rstrip('/')}/agent/nodes/{node_id}/inventory"
+                    )
+                    response.raise_for_status()
+                    result = await asyncio.to_thread(
+                        executor.garbage_collect, dict(response.json()), gc_grace
+                    )
+                    report = await client.post(
+                        f"{base_url.rstrip('/')}/agent/nodes/{node_id}/gc-report",
+                        json={"status": "SUCCEEDED", **result},
+                    )
+                    report.raise_for_status()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    try:
+                        await client.post(
+                            f"{base_url.rstrip('/')}/agent/nodes/{node_id}/gc-report",
+                            json={
+                                "status": "FAILED",
+                                "removed": {},
+                                "reclaimed_bytes": 0,
+                                "error": str(exc)[:1000],
+                            },
+                        )
+                    except Exception:
+                        pass
+                await asyncio.sleep(gc_interval)
+
         tasks = [
             asyncio.create_task(terminal_loop()),
             asyncio.create_task(heartbeat_loop()),
+            asyncio.create_task(garbage_collection_loop()),
             *[asyncio.create_task(job_worker()) for _ in range(concurrency)],
         ]
         if auto_update_enabled:

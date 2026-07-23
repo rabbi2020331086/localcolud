@@ -63,6 +63,12 @@ class NodeJobStatus(enum.StrEnum):
     FAILED = "FAILED"
 
 
+class RecoveryPointStatus(enum.StrEnum):
+    CREATING = "CREATING"
+    AVAILABLE = "AVAILABLE"
+    FAILED = "FAILED"
+
+
 class ComputeProvider(enum.StrEnum):
     MULTIPASS = "multipass"
     VAGRANT_LIBVIRT = "vagrant-libvirt"
@@ -163,6 +169,11 @@ class CloudNode(StoredModel):
     network_interfaces: list[dict[str, str]] = Field(default_factory=list)
     virtual_networks: list[str] = Field(default_factory=list)
     last_seen_at: datetime | None = None
+    last_gc_at: datetime | None = None
+    last_gc_status: str | None = None
+    last_gc_removed: dict[str, int] = Field(default_factory=dict)
+    last_gc_reclaimed_bytes: int = 0
+    last_gc_error: str | None = None
     updated_at: datetime = Field(default_factory=now)
 
 
@@ -192,8 +203,40 @@ class NodeJob(StoredModel):
     lease_expires_at: datetime | None = None
     result_payload: dict[str, Any] = Field(default_factory=dict)
     error_message: str | None = None
+    progress: int = 0
+    progress_message: str = "Queued"
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    updated_at: datetime = Field(default_factory=now)
+
+
+class ReplicationPolicy(StoredModel):
+    user_id: UUID
+    instance_id: UUID
+    enabled: bool = False
+    interval_minutes: int = 30
+    replica_count: int = 2
+    retention_points: int = 3
+    pause_seconds_warning: int = 30
+    updated_by: UUID | None = None
+    updated_at: datetime = Field(default_factory=now)
+
+
+class RecoveryPoint(StoredModel):
+    instance_id: UUID
+    source_node_id: UUID
+    status: RecoveryPointStatus = RecoveryPointStatus.CREATING
+    size_bytes: int = 0
+    pause_seconds: float = 0
+    sha256: str | None = None
+    canonical_present: bool = False
+    replica_node_ids: list[UUID] = Field(default_factory=list)
+    requested_by: UUID | None = None
+    automatic: bool = True
+    error_message: str | None = None
+    progress: int = 0
+    progress_message: str = "Queued"
+    completed_at: datetime | None = None
     updated_at: datetime = Field(default_factory=now)
 
 

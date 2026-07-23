@@ -22,6 +22,7 @@ from app.services import load_balancing as load_balancing_service
 from app.services import node_jobs
 from app.services import operations as operation_service
 from app.services import reconciliation as reconciliation_service
+from app.services import replication as replication_service
 
 log = logging.getLogger("localec2")
 
@@ -51,19 +52,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             if attempt == 3:
                 raise
             log.warning("MongoDB initialization failed; retrying (%s/3)", attempt)
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
     operation_service.worker_task = asyncio.create_task(operation_service.operation_loop())
     autoscaling_service.worker_task = asyncio.create_task(autoscaling_service.autoscaling_loop())
     load_balancing_service.worker_task = asyncio.create_task(load_balancing_service.health_loop())
     reconciliation_service.worker_task = asyncio.create_task(
         reconciliation_service.reconciliation_loop()
     )
+    replication_service.worker_task = asyncio.create_task(replication_service.replication_loop())
     yield
     tasks = [
         operation_service.worker_task,
         autoscaling_service.worker_task,
         load_balancing_service.worker_task,
         reconciliation_service.worker_task,
+        replication_service.worker_task,
     ]
     for task in tasks:
         task.cancel()
@@ -276,10 +279,15 @@ async def admin_terminal_ws(websocket: WebSocket) -> None:
     terminal_clients[session_id] = websocket
     terminal_session_nodes[session_id] = node_id
     try:
-        await channel.send({
-            "type": "start", "target": "host", "session_id": session_id,
-            "rows": 30, "cols": 120,
-        })
+        await channel.send(
+            {
+                "type": "start",
+                "target": "host",
+                "session_id": session_id,
+                "rows": 30,
+                "cols": 120,
+            }
+        )
         while True:
             message = await websocket.receive_json()
             if message.get("type") in ("input", "resize"):

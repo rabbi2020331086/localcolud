@@ -2,7 +2,7 @@
 
 > **Purpose of this document:** Give a new developer or AI assistant enough accurate context to understand, run, debug, extend, and discuss this project without first reverse-engineering the whole repository.
 >
-> **Snapshot basis:** The repository as it exists on 2026-07-21. The working tree contains substantial uncommitted changes, so the current files—not Git history and not older explanatory documents—are the source of truth.
+> **Snapshot basis:** The repository as it exists on 2026-07-23. The working tree contains substantial uncommitted changes, so the current files—not Git history and not older explanatory documents—are the source of truth.
 
 ## 1. Executive summary
 
@@ -156,6 +156,7 @@ EC2_V3/
 │       │   ├── operations.py     Durable lifecycle-operation worker
 │       │   ├── autoscaling.py    Desired capacity and CPU policy loop
 │       │   ├── load_balancing.py HAProxy config/sync and target health loop
+│       │   ├── replication.py    Snapshot scheduling, capture, copies, retention
 │       │   └── reconciliation.py Actual-state checks and expired lease cleanup
 │       └── workers/              Package placeholder/legacy organization
 ├── frontend/
@@ -182,7 +183,7 @@ EC2_V3/
 └── admin-frontend/
     ├── package.json              Admin UI dependencies/scripts
     └── src/
-        ├── App.tsx               Login plus overview/nodes/workloads/storage/access pages
+        ├── App.tsx               Login plus fleet/workloads/storage/replication/RBAC pages
         ├── api.ts                Admin Axios/session client
         ├── types.ts              Admin API types
         └── styles.css            Admin UI styling
@@ -265,12 +266,12 @@ There are two asynchronous layers:
 
 Operations transition `PENDING -> RUNNING -> SUCCEEDED/FAILED`. The worker uses atomic claiming and configured concurrency. Node jobs transition `QUEUED -> LEASED -> SUCCEEDED/FAILED`. The agent renews long job leases while work continues. Expired leases are requeued within the retry policy or failed, preventing a dead agent from owning work forever. Job payload secrets such as the Tailscale auth key are redacted after completion.
 
-Supported agent jobs include `LAUNCH`, `START`, `STOP`, `SUSPEND`, `DELETE`, `EXEC`, `INSPECT`, `TAILSCALE_SETUP`, `VOLUME_ATTACH`, `VOLUME_DETACH`, and `VOLUME_DELETE`.
+Supported agent jobs include `LAUNCH`, `START`, `STOP`, `SUSPEND`, `DELETE`, `EXEC`, `INSPECT`, `TAILSCALE_SETUP`, volume and AMI transfer jobs, `REPLICA_CAPTURE`, `REPLICA_DOWNLOAD`, `REPLICA_DELETE`, and `RECOVER`.
 
 ### 6.6 Monitoring and reconciliation
 
-- The metrics WebSocket runs commands inside a running guest every two seconds and returns CPU, memory, root-disk, and network counters.
-- A snapshot REST endpoint provides point-in-time metrics.
+- The metrics WebSocket runs commands inside a running guest every second and returns CPU, memory, root-disk, and network counters.
+- The instance Resources and Analytics pages request a snapshot REST sample every second and retain the latest 300 points, giving a rolling five-minute, one-point-per-second view.
 - The reconciliation worker periodically inspects non-transitional distributed instances.
 - Provider states map to LocalEC2 states (`running`, `shutoff/poweroff`, `suspended`, etc.).
 - If an assigned node goes offline while an instance was believed running, the instance becomes `UNKNOWN` with an explanation.
@@ -345,6 +346,23 @@ When `TAILSCALE_REUSABLE_AUTH_KEY` is configured, instance launch can dispatch a
 
 Before using it, the tailnet must have MagicDNS, HTTPS, and Funnel enabled. `TAILSCALE_INSTANCE_TAG` is optional and only valid after matching `tagOwner`/permissions and an auth key allowed to apply the tag. Funnel exposes a port; it does not by itself deploy the customer's application. Security-group rules must allow the service port.
 
+### 6.15 Snapshots and asynchronous disaster recovery
+
+Every customer instance has snapshot controls on its Actions page. The owner can create an immediate root-disk point, enable a per-instance schedule, choose the interval, request one or two copies on other eligible laptops, set retention, inspect progress/history, download the canonical qcow2, or delete the point and its reachable replicas.
+
+Snapshot pipeline:
+
+1. The API creates a `RecoveryPoint` in `CREATING` state.
+2. The source agent briefly suspends a running libvirt domain and converts its root disk into a standalone compressed qcow2.
+3. The VM is resumed, the file is SHA-256 verified, and the canonical copy is uploaded to `RECOVERY_STORAGE_ROOT`.
+4. The scheduler selects approved, online replica nodes other than the source.
+5. Each destination downloads the canonical file and verifies its checksum.
+6. The point becomes `AVAILABLE`; retention removes older excess points.
+
+Capture, verification, and canonical upload occupy overall progress 1–89%. Replica distribution occupies 90–99%, but its message reports the real destination transfer percentage, for example `Copying (37%) snapshot to toua`. Agent 0.7.1 renews long snapshot/copy jobs and reports transfer progress once per second. Both customer and administrator replication views poll active state every second.
+
+The administrator Replication workspace provides cross-tenant policy override, immediate capture, live stage/error visibility, source and replica placement, checksum/integrity details, recovery to an eligible node, and deletion of all copies. Recovery is deliberately fenced: the original node must be offline, attached persistent volumes must first be detached, and the target must have capacity. This restores disk state only; it is not live migration, RAM-state recovery, application-consistent backup, synchronous replication, or zero-loss HA.
+
 ## 7. Domain model and MongoDB collections
 
 | Model/collection | Meaning and important relationships |
@@ -365,6 +383,8 @@ Before using it, the tailnet must have MagicDNS, HTTPS, and Funnel enabled. `TAI
 | `security_groups` | Guest firewall rules |
 | `volumes` | Canonical/local node placement and attachment metadata |
 | `amis` | Reusable backing image and source/node metadata |
+| `replication_policies` | Per-instance schedule, replica count, retention, and pause warning |
+| `recovery_points` | Snapshot source, canonical/replica placement, checksum, progress, and outcome |
 
 MongoDB UUIDs/enums are serialized as strings; model `id` maps to Mongo `_id`. Initialization performs compatibility migrations, creates unique/lookup indexes, converts legacy load balancers to target groups, gives old nodes reservation defaults, and rebuilds capacity counters.
 
@@ -382,7 +402,7 @@ All REST endpoints below are under `/api/v1` unless noted.
 
 ### Customer resources
 
-- Instances: list/create/get, start/retry/stop/hibernate/delete, SSH key, zone capacity, metric snapshot
+- Instances: list/create/get, start/retry/stop/hibernate/delete, SSH key, zone capacity, metric snapshot, replication policy, snapshot create/list/download/delete
 - Operations: list/get
 - One-time secrets: token download
 - Launch templates: CRUD
@@ -399,13 +419,14 @@ All REST endpoints below are under `/api/v1` unless noted.
 - Nodes: list/enroll/update/delete/rotate token (platform protected)
 - Agent heartbeat, job claim, lease renewal, completion
 - Agent installer, current `agent.py`, service unit
-- Authenticated volume image download/upload
+- Authenticated volume, AMI, and recovery-point transfer
 
 ### Platform admin
 
 - Overview and cross-tenant operation history
 - Cross-tenant instance/workload list, lifecycle intervention, diagnostics
 - Cross-tenant volume list, force detach/delete
+- Replication policy override, immediate snapshot, live recovery catalogue, recover/delete
 - Node contribution/capacity reporting
 - Team list/create/update and role management
 
@@ -433,11 +454,11 @@ Routes:
 - `/operations`
 - `/volumes`, `/security-groups`, `/key-pairs`, `/amis`
 
-TanStack Query supplies polling/caching and mutation invalidation. Axios targets `VITE_API_URL`; WebSockets use `VITE_WS_URL`. Zustand holds the current access token/user in memory. The Axios layer attaches authentication and participates in refresh/session recovery. xterm.js renders terminal sessions, and Recharts supports monitoring displays.
+TanStack Query supplies polling/caching and mutation invalidation. Axios targets `VITE_API_URL`; WebSockets use `VITE_WS_URL`. Zustand holds the current access token/user in memory. The Axios layer attaches authentication and participates in refresh/session recovery. xterm.js renders terminal sessions, and Recharts supports monitoring displays. Resource and analytics charts collect one data point per second. Completed snapshots expose explicit Download and Delete actions.
 
 ### Platform console (`admin-frontend`, port 5174)
 
-This is deliberately separate from the customer UI. Its single-page shell exposes overview, infrastructure/nodes, workloads/diagnostics, storage, operation audit, and access/team administration depending on role. It polls platform data at roughly 8–15 second intervals.
+This is deliberately separate from the customer UI. Its single-page shell exposes overview, infrastructure/nodes, workloads/diagnostics, storage, replication/recovery, operation audit, and access/team administration depending on role. Active replication state refreshes every second; slower fleet inventories refresh independently.
 
 ## 10. Configuration
 
@@ -468,6 +489,8 @@ Important backend variables:
 | `NODE_JOB_*` | Poll, lease, and timeout behavior |
 | `VOLUME_STORAGE_ROOT` | Canonical detached qcow2 storage |
 | `AMI_STORAGE_ROOT` | Canonical cross-node Vagrant package storage |
+| `RECOVERY_STORAGE_ROOT` | Canonical downloadable snapshot qcow2 storage |
+| `REPLICATION_POLL_SECONDS` | Scheduled-snapshot evaluation interval |
 
 Frontend variables are `VITE_API_URL` and `VITE_WS_URL`. The agent uses `LOCAL_EC2_API_URL`, `LOCAL_EC2_NODE_ID`, `LOCAL_EC2_NODE_TOKEN`, `LOCAL_EC2_STORAGE_ROOT`, launch timeout, Vagrant executable/home, and libvirt URI; optional OVMF path overrides support nonstandard distributions.
 
@@ -510,6 +533,142 @@ virsh --connect qemu:///system list --all
 ```
 
 The first launch may be slow while Vagrant downloads the Bento box. Pre-caching the configured boxes on every node reduces this delay.
+
+### Production hosting: Vercel frontends plus a persistent backend
+
+The supported production topology is:
+
+```text
+app.example.com   -> Vercel project rooted at frontend/
+admin.example.com -> Vercel project rooted at admin-frontend/
+api.example.com   -> persistent Ubuntu VPS/container running one FastAPI process
+MongoDB           -> MongoDB Atlas or another durable reachable replica set
+API data disk     -> persistent, backed-up volume for volumes/, amis/, recovery-points/
+compute nodes     -> outbound HTTPS + WSS to api.example.com
+```
+
+Do **not** deploy the current FastAPI application as ordinary Vercel Functions if all LocalEC2 features must work. The API lifespan starts five continuous process-local workers (operations, autoscaling, load-balancer health, reconciliation, and replication). It also holds the live node/customer terminal relay in process memory, waits on hour-long node jobs, accepts and serves multi-gigabyte qcow2/box files, and writes canonical storage to the local filesystem. Vercel Functions are invocation-scoped, have maximum durations and payload limits, and do not provide this application with a durable local disk or a guaranteed single process. Vercel now supports WebSockets, but a connection is pinned only for the function invocation duration and a later connection is not guaranteed to reach the same instance. Official references: [Vercel Functions limits](https://vercel.com/docs/functions/limitations), [WebSockets on Vercel Functions](https://vercel.com/kb/guide/do-vercel-serverless-functions-support-websocket-connections), and [Vercel monorepos](https://vercel.com/docs/monorepos).
+
+#### 1. Prepare production DNS and TLS
+
+Use three stable hostnames under one parent domain where possible: `app.example.com`, `admin.example.com`, and `api.example.com`. Keeping them same-site reduces refresh-cookie problems. The API must be HTTPS and its WebSockets must be WSS. Point the first two names to Vercel and the API name to the persistent backend/reverse proxy.
+
+#### 2. Deploy the customer console to Vercel
+
+Import the repository as a new Vercel project and set:
+
+- Root Directory: `frontend`
+- Framework: Vite
+- Install command: `pnpm install --frozen-lockfile`
+- Build command: `pnpm build`
+- Output directory: `dist`
+- Production environment: `VITE_API_URL=https://api.example.com/api/v1`
+- Production environment: `VITE_WS_URL=wss://api.example.com/ws`
+
+Because this is a client-side SPA, add a fallback rewrite in `frontend/vercel.json` if Vercel does not automatically preserve deep routes:
+
+```json
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
+}
+```
+
+`VITE_*` variables are compiled into the browser bundle, so redeploy after changing them. Do not put secrets in any `VITE_*` variable.
+
+#### 3. Deploy the admin console to Vercel
+
+Create a second Vercel project from the same repository:
+
+- Root Directory: `admin-frontend`
+- Framework: Vite
+- Install command: `pnpm install --frozen-lockfile`
+- Build command: `pnpm build`
+- Output directory: `dist`
+- Production environment: `VITE_API_URL=https://api.example.com/api/v1`
+
+Use the same SPA rewrite, placed at `admin-frontend/vercel.json`. Protect the admin hostname with platform login plus any available identity-aware proxy/VPN; hiding the link is not access control.
+
+#### 4. Provision MongoDB
+
+Create a dedicated production database/user, require TLS, use a long URL-encoded password, allow network access only from the API server where practical, enable backups, and set `MONGODB_URI` and `MONGODB_DATABASE`. Do not whitelist the entire Internet merely to simplify setup.
+
+#### 5. Run FastAPI on persistent compute
+
+Use an Ubuntu VPS, VM, or container host with Python 3.11+, a static public/VPN address, and a mounted persistent data volume. From `backend/`:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install .
+.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Run that command under systemd, Docker Compose, or another restart manager. Keep `--workers 1`: the current background loops and in-memory terminal maps are not coordinated across multiple API processes.
+
+Set at least these production variables:
+
+```dotenv
+APP_ENV=production
+API_PREFIX=/api/v1
+MONGODB_URI=mongodb+srv://...
+MONGODB_DATABASE=stratus
+JWT_SECRET=<at-least-32-random-characters>
+PRIVATE_KEY_ENCRYPTION_KEY=<stable-Fernet-key>
+FRONTEND_ORIGIN=https://app.example.com
+ADMIN_FRONTEND_ORIGIN=https://admin.example.com
+PLATFORM_ADMIN_EMAIL=owner@example.com
+DEVELOPMENT_DEFAULT_ADMIN=false
+VOLUME_STORAGE_ROOT=/srv/localec2/data/volumes
+AMI_STORAGE_ROOT=/srv/localec2/data/amis
+RECOVERY_STORAGE_ROOT=/srv/localec2/data/recovery-points
+```
+
+Generate secrets locally and store them in the server's secret manager/root-readable environment file:
+
+```bash
+openssl rand -hex 32
+python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+```
+
+Also configure Tailscale and timing/capacity variables from `backend/env.example` as required. Never regenerate `PRIVATE_KEY_ENCRYPTION_KEY` after data has been encrypted.
+
+#### 6. Put an HTTPS reverse proxy in front of FastAPI
+
+Use Caddy, nginx, Traefik, or a managed load balancer for `api.example.com`. It must:
+
+- proxy normal HTTP to `127.0.0.1:8000`;
+- preserve WebSocket upgrades for `/ws/*`;
+- allow long-lived WebSockets and long snapshot/AMI/volume transfers;
+- allow request/response bodies larger than the largest qcow2/box image;
+- use long upstream read/write timeouts for node transfers;
+- preserve `Host`, forwarding, and request ID headers;
+- expose only HTTPS publicly and redirect HTTP to HTTPS.
+
+Back up all three canonical storage directories and MongoDB together. Database-only backup is insufficient because MongoDB contains metadata while the large files live on disk.
+
+#### 7. Reconnect compute nodes
+
+For every node, set `LOCAL_EC2_API_URL=https://api.example.com/api/v1`, retain its correct node ID/token, restart `localec2-agent`, and verify its heartbeat in Admin > Infrastructure. Outbound firewall/DNS must permit HTTPS and WSS to the API. Upgrade nodes to published agent 0.7.1 so per-second snapshot-copy progress works.
+
+#### 8. Production acceptance checklist
+
+Verify in order:
+
+1. `GET https://api.example.com/health` and `/health/readiness` return healthy.
+2. Customer and admin login, refresh after page reload, and logout work in current browsers.
+3. CORS contains exactly the two production origins and no wildcard with credentials.
+4. An approved node remains online for several minutes.
+5. Launch, one-second metrics, browser terminal, stop/start, and terminate work.
+6. Manual snapshot shows conversion, upload, and `Copying (1%...100%)` progress in both consoles.
+7. Snapshot download, replica checksum, retention, delete, and a fenced test recovery work.
+8. Volume detach/reattach, AMI transfer, autoscaling, load-balancer health, and Funnel are tested if enabled.
+9. API restart preserves MongoDB state, secrets remain decryptable, workers resume, and canonical files remain available.
+10. Monitoring alerts cover API readiness, MongoDB, disk capacity, certificate expiry, offline nodes, failed operations, and failed snapshots.
+
+#### If all three components must run on Vercel
+
+That is a redesign, not a deployment-setting change. Move worker loops to a durable queue/workflow service with distributed locks; move volumes, AMIs, and snapshots to object storage with direct multipart/signed transfers; replace in-memory terminal routing with a durable WebSocket gateway/pub-sub registry; make every operation resumable and idempotent across function invocations; schedule reconciliation/replication externally; and remove long blocking capture/recovery requests. The current code should not be advertised as fully functional on an all-Vercel backend until those changes and real-node integration tests are complete.
 
 ## 12. Development and verification
 

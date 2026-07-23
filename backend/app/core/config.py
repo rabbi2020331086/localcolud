@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     node_job_timeout_seconds: int = 1200
     volume_storage_root: str = "./data/volumes"
     ami_storage_root: str = "./data/amis"
+    recovery_storage_root: str = "./data/recovery-points"
+    replication_poll_seconds: float = 15
     agent_release_root: str = "./data/agent-releases"
 
     @model_validator(mode="after")

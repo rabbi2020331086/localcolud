@@ -64,6 +64,11 @@ export type CloudNode = {
   network_interfaces: { name: string; family: string; address: string }[];
   virtual_networks: string[];
   last_seen_at: string | null;
+  last_gc_at: string | null;
+  last_gc_status: string | null;
+  last_gc_removed: Record<string, number>;
+  last_gc_reclaimed_bytes: number;
+  last_gc_error: string | null;
 };
 
 export type Enrollment = CloudNode & { enrollment_token: string };
@@ -121,3 +126,21 @@ export type AdminOperation = {
   progress: number; message: string; error_message: string | null; created_at: string;
   started_at: string | null; finished_at: string | null;
 };
+
+export type ReplicationPolicy = {
+  id?: string; user_id?: string; instance_id?: string;
+  enabled: boolean; interval_minutes: number; replica_count: number;
+  retention_points: number; pause_seconds_warning: number; updated_at: string;
+};
+
+export type RecoveryPoint = {
+  id: string; instance_id: string; instance: string; source_node_id: string;
+  source_node: string | null; status: string; size_bytes: number; pause_seconds: number;
+  sha256: string | null;
+  canonical_present: boolean; replica_node_ids: string[]; replica_nodes: string[];
+  automatic: boolean; error_message: string | null; created_at: string;
+  progress: number; progress_message: string;
+  completed_at: string | null;
+};
+
+export type ReplicationStatus = { policy: ReplicationPolicy; policies: ReplicationPolicy[]; points: RecoveryPoint[] };

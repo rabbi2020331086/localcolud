@@ -176,6 +176,8 @@ echo "[6/7] Writing the protected node configuration"
   printf 'LOCAL_EC2_AUTO_UPDATE=true\n'
   printf 'LOCAL_EC2_AUTO_UPDATE_INTERVAL_SECONDS=300\n'
   printf 'LOCAL_EC2_LAUNCH_TIMEOUT_SECONDS=1800\n'
+  printf 'LOCAL_EC2_GC_INTERVAL_SECONDS=300\n'
+  printf 'LOCAL_EC2_GC_GRACE_SECONDS=3600\n'
   printf 'VAGRANT_EXECUTABLE=/usr/bin/vagrant\n'
   printf 'VAGRANT_HOME=/var/lib/localec2/.vagrant.d\n'
   printf 'LIBVIRT_DEFAULT_URI=qemu:///system\n'

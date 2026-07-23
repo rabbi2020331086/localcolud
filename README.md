@@ -123,6 +123,47 @@ provide synchronous replication while attached; automatic node-failure recovery 
 replicated backend such as Ceph RBD, fencing, backups, and recovery testing. AMI mutation remains
 disabled.
 
+### Classroom disaster recovery
+
+Every customer instance includes **Snapshots and recovery protection** under its Actions page. The
+instance owner can take manual snapshots at any time, independently enable or disable a per-instance
+schedule, choose the interval, request one or two laptop copies, set retention, inspect history, and
+delete their own points. A full administrator sees every tenant policy and recovery point in the
+separate **Replication** workspace and can override policy, force a snapshot, delete copies, or
+recover an instance onto a selected healthy node.
+During capture, agent 0.6.5 briefly pauses a running libvirt domain, uses compressed `qemu-img
+convert` output with a
+shared read-only source lock to make
+a standalone qcow2, resumes the guest, uploads a canonical copy, and downloads checksum-verified
+copies to other enrolled nodes. MongoDB records the source, replica nodes, size, checksum, status,
+and completion time.
+Live conversion, verification, upload, and replica-distribution stages are persisted in MongoDB and
+shown to customers as a percentage and progress bar while the snapshot is being created.
+
+Recovery is deliberately fenced: the source node must be offline, the destination must have spare
+schedulable capacity, and attached persistent volumes must be detached first. Recovery launches a
+new Vagrant/libvirt definition and replaces its root disk with the selected point. RAM state and
+writes newer than the point are lost. This is classroom disaster recovery, not synchronous storage,
+live migration, application-consistent backup, or zero-data-loss high availability. The canonical
+`RECOVERY_STORAGE_ROOT` is still a control-plane failure domain and should itself be backed up.
+
+Upgrade every participating node from Admin > Agent/Infrastructure before enabling the policy.
+
+### Agent orphan-resource collection
+
+Agent 0.7.0 fetches a fresh authenticated inventory for its own node every five minutes and
+reconciles only LocalEC2-namespaced resources. An item must remain absent from the authoritative
+MongoDB inventory for a one-hour grace period before deletion. The collector covers orphaned
+`localec2-*` libvirt domains and Vagrant workspaces, node-local recovery qcow2 files, portable-volume
+qcow2 files, AMI transfer packages, and deleted AMI Vagrant-box caches. It never targets foreign
+libvirt domains or arbitrary host paths, and it performs no cleanup when the control plane cannot
+provide a fresh inventory.
+
+Configure node intervals with `LOCAL_EC2_GC_INTERVAL_SECONDS` and
+`LOCAL_EC2_GC_GRACE_SECONDS`. The minimum grace period is five minutes; one hour is the safe default.
+Each node reports the last collection time, status, category counts, reclaimed bytes, and error to
+Admin > Infrastructure > node summary.
+
 Agent 0.5.4 adds safe remote self-updates, explicitly gated administrator-only sudo host commands, and replicated AMI package transfer in addition to
 reverse PTY, portable volume jobs, and secure Tailscale/Funnel provisioning. Upgrade an
 existing node without rotating its token:

@@ -67,6 +67,10 @@ def from_documents(model_type: type[ModelType], documents: Iterable[Document]) -
 
 async def initialize_database() -> None:
     await database.command("ping")
+    # Version 0.6.0 briefly used one global replication policy. Protection is
+    # customer-owned per instance now, so never reinterpret that row as a
+    # tenant policy during an upgrade.
+    await database.replication_policies.delete_one({"_id": "global"})
     # Older installations did not persist placement or host-reservation fields.
     # Set explicit legacy/safe values before models are read so an upgrade can
     # never reinterpret a control-plane Multipass VM as distributed capacity.
@@ -222,6 +226,19 @@ async def initialize_database() -> None:
             IndexModel("operation_id"),
             IndexModel("instance_id"),
             IndexModel("lease_expires_at"),
+        ]
+    )
+    await database.recovery_points.create_indexes(
+        [
+            IndexModel([("instance_id", ASCENDING), ("created_at", DESCENDING)]),
+            IndexModel([("status", ASCENDING), ("created_at", DESCENDING)]),
+            IndexModel("replica_node_ids"),
+        ]
+    )
+    await database.replication_policies.create_indexes(
+        [
+            IndexModel("instance_id", unique=True),
+            IndexModel([("user_id", ASCENDING), ("enabled", ASCENDING)]),
         ]
     )
     await database.operations.create_indexes(

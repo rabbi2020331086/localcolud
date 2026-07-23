@@ -1,7 +1,7 @@
 import shlex
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException
 from pymongo.errors import DuplicateKeyError
@@ -20,6 +20,8 @@ from app.infrastructure.models import (
     OperationStatus,
     OperationType,
     PlatformRole,
+    RecoveryPoint,
+    ReplicationPolicy,
     User,
     Volume,
 )
@@ -27,13 +29,300 @@ from app.infrastructure.vm import ProviderUnavailable
 from app.schemas import (
     AgentUpdateIn,
     HostCommandIn,
+    RecoveryRequestIn,
+    ReplicationPolicyIn,
     TeamMemberCreate,
     TeamMemberOut,
     TeamMemberUpdate,
 )
-from app.services import node_jobs, scheduler
+from app.services import node_jobs, replication, scheduler
+from app.services.operations import security_script
 
 router = APIRouter(prefix="/admin", tags=["Platform administration"])
+
+
+def recovery_output(
+    point: RecoveryPoint,
+    instances: dict[str, Instance],
+    nodes: dict[str, CloudNode],
+) -> dict[str, object]:
+    instance = instances.get(str(point.instance_id))
+    return {
+        "id": str(point.id),
+        "instance_id": str(point.instance_id),
+        "instance": instance.display_name if instance else "Deleted instance",
+        "source_node_id": str(point.source_node_id),
+        "source_node": nodes.get(str(point.source_node_id)).name
+        if nodes.get(str(point.source_node_id))
+        else None,
+        "status": point.status,
+        "size_bytes": point.size_bytes,
+        "pause_seconds": point.pause_seconds,
+        "sha256": point.sha256,
+        "canonical_present": point.canonical_present,
+        "replica_node_ids": [str(value) for value in point.replica_node_ids],
+        "replica_nodes": [
+            nodes[str(value)].name for value in point.replica_node_ids if str(value) in nodes
+        ],
+        "automatic": point.automatic,
+        "error_message": point.error_message
+        or (
+            f"{point.progress}% · {point.progress_message}"
+            if point.status.value == "CREATING"
+            else None
+        ),
+        "progress": point.progress,
+        "progress_message": point.progress_message,
+        "created_at": point.created_at,
+        "completed_at": point.completed_at,
+    }
+
+
+@router.get("/replication")
+async def replication_status(admin: PlatformOperator, database: Database) -> dict[str, object]:
+    points = from_documents(
+        RecoveryPoint,
+        await database.recovery_points.find({}).sort("created_at", -1).limit(250).to_list(None),
+    )
+    instances = {
+        str(item.id): item
+        for item in from_documents(Instance, await database.instances.find({}).to_list(None))
+    }
+    nodes = {
+        str(item.id): item
+        for item in from_documents(CloudNode, await database.cloud_nodes.find({}).to_list(None))
+    }
+    policies = from_documents(
+        ReplicationPolicy, await database.replication_policies.find({}).to_list(None)
+    )
+    displayed = policies[0].model_dump(mode="json") if policies else {
+        "enabled": False,
+        "interval_minutes": 30,
+        "replica_count": 2,
+        "retention_points": 3,
+        "pause_seconds_warning": 30,
+        "updated_at": datetime.now(UTC),
+    }
+    return {
+        "policy": displayed,
+        "policies": [item.model_dump(mode="json") for item in policies],
+        "points": [recovery_output(point, instances, nodes) for point in points],
+    }
+
+
+@router.put("/replication/policy")
+async def override_all_replication_policies(
+    data: ReplicationPolicyIn, admin: PlatformAdmin, database: Database
+) -> dict[str, object]:
+    """Administrator bulk override; customers otherwise own each instance policy."""
+    now = datetime.now(UTC)
+    instances = from_documents(
+        Instance,
+        await database.instances.find(
+            {
+                "deleted_at": None,
+                "$or": [{"system_role": "customer"}, {"system_role": {"$exists": False}}],
+            }
+        ).to_list(None),
+    )
+    for item in instances:
+        await database.replication_policies.update_one(
+            {"instance_id": str(item.id)},
+            {
+                "$set": {
+                    **data.model_dump(),
+                    "user_id": str(item.user_id),
+                    "updated_by": str(admin.id),
+                    "updated_at": now,
+                },
+                "$setOnInsert": {
+                    "_id": str(uuid4()),
+                    "instance_id": str(item.id),
+                    "created_at": now,
+                },
+            },
+            upsert=True,
+        )
+    return {**data.model_dump(), "instances_overridden": len(instances), "updated_at": now}
+
+
+@router.put("/instances/{instance_id}/replication-policy")
+async def update_replication_policy(
+    instance_id: UUID,
+    data: ReplicationPolicyIn,
+    admin: PlatformAdmin,
+    database: Database,
+) -> dict[str, object]:
+    item = await admin_instance(database, instance_id)
+    now = datetime.now(UTC)
+    changes = {**data.model_dump(), "updated_by": str(admin.id), "updated_at": now}
+    await database.replication_policies.update_one(
+        {"instance_id": str(item.id)},
+        {
+            "$set": changes,
+            "$setOnInsert": {
+                "_id": str(uuid4()),
+                "user_id": str(item.user_id),
+                "instance_id": str(item.id),
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+    return {
+        **changes,
+        "user_id": str(item.user_id),
+        "instance_id": str(item.id),
+    }
+
+
+@router.post("/instances/{instance_id}/recovery-points")
+async def create_recovery_point(
+    instance_id: UUID, admin: PlatformAdmin, database: Database
+) -> dict[str, object]:
+    item = await admin_instance(database, instance_id)
+    try:
+        point = await replication.capture(item, requested_by=admin.id)
+    except Exception as exc:
+        raise HTTPException(502, str(exc)) from exc
+    nodes = {
+        str(node.id): node
+        for node in from_documents(CloudNode, await database.cloud_nodes.find({}).to_list(None))
+    }
+    return recovery_output(point, {str(item.id): item}, nodes)
+
+
+@router.delete("/recovery-points/{recovery_point_id}", status_code=204)
+async def delete_recovery_point(
+    recovery_point_id: UUID, admin: PlatformAdmin, database: Database
+) -> None:
+    point = from_document(
+        RecoveryPoint,
+        await database.recovery_points.find_one({"_id": str(recovery_point_id)}),
+    )
+    if not point:
+        raise HTTPException(404, "Recovery point not found")
+    if point.status.value == "CREATING":
+        raise HTTPException(409, "A recovery point cannot be deleted while it is being created")
+    await replication.remove_point(point)
+
+
+@router.post("/recovery-points/{recovery_point_id}/recover")
+async def recover_instance(
+    recovery_point_id: UUID,
+    data: RecoveryRequestIn,
+    admin: PlatformAdmin,
+    database: Database,
+) -> dict[str, object]:
+    point = from_document(
+        RecoveryPoint,
+        await database.recovery_points.find_one(
+            {"_id": str(recovery_point_id), "status": "AVAILABLE"}
+        ),
+    )
+    if not point:
+        raise HTTPException(404, "Available recovery point not found")
+    item = await admin_instance(database, point.instance_id)
+    if await database.volumes.find_one({"attached_instance_id": str(item.id)}):
+        raise HTTPException(409, "Detach persistent volumes before root-disk recovery")
+    if await database.operations.find_one(
+        {"instance_id": str(item.id), "status": {"$in": ["PENDING", "RUNNING"]}}
+    ):
+        raise HTTPException(409, "Another instance operation is active")
+    deadline = datetime.now(UTC) - timedelta(seconds=settings.node_offline_seconds)
+    source = (
+        from_document(CloudNode, await database.cloud_nodes.find_one({"_id": str(item.node_id)}))
+        if item.node_id
+        else None
+    )
+    if source and source.last_seen_at and source.last_seen_at >= deadline:
+        raise HTTPException(409, "Source node is still online; fence or drain it before recovery")
+    target = await scheduler.reserve_node(
+        database,
+        item.cpu_count,
+        item.memory_mb,
+        item.disk_gb,
+        required_node_id=data.target_node_id,
+    )
+    if target.id == item.node_id:
+        await database.cloud_nodes.update_one(
+            {"_id": str(target.id)},
+            {
+                "$inc": {
+                    "cpu_allocated": -item.cpu_count,
+                    "memory_allocated_mb": -item.memory_mb,
+                    "storage_allocated_gb": -item.disk_gb,
+                }
+            },
+        )
+        raise HTTPException(409, "Recovery target must differ from the failed source node")
+    payload = {
+        "name": item.multipass_name,
+        "image": item.image,
+        "cpu_count": item.cpu_count,
+        "memory_mb": item.memory_mb,
+        "disk_gb": item.disk_gb,
+        "public_key": "",
+        "user_data": "",
+        "security_script": await security_script(item),
+        "ami_id": str(item.ami_id) if item.ami_id else "",
+        "recovery_point_id": str(point.id),
+    }
+    try:
+        remote = await node_jobs.dispatch_node(target, "RECOVER", payload, timeout=3600)
+    except Exception as exc:
+        await database.cloud_nodes.update_one(
+            {"_id": str(target.id)},
+            {
+                "$inc": {
+                    "cpu_allocated": -item.cpu_count,
+                    "memory_allocated_mb": -item.memory_mb,
+                    "storage_allocated_gb": -item.disk_gb,
+                }
+            },
+        )
+        raise HTTPException(502, f"Recovery failed: {exc}") from exc
+    if item.node_id and item.capacity_reserved:
+        await database.cloud_nodes.update_one(
+            {"_id": str(item.node_id)},
+            [
+                {
+                    "$set": {
+                        "cpu_allocated": {
+                            "$max": [0, {"$subtract": ["$cpu_allocated", item.cpu_count]}]
+                        },
+                        "memory_allocated_mb": {
+                            "$max": [0, {"$subtract": ["$memory_allocated_mb", item.memory_mb]}]
+                        },
+                        "storage_allocated_gb": {
+                            "$max": [0, {"$subtract": ["$storage_allocated_gb", item.disk_gb]}]
+                        },
+                        "updated_at": datetime.now(UTC),
+                    }
+                }
+            ],
+        )
+    now = datetime.now(UTC)
+    await database.instances.update_one(
+        {"_id": str(item.id)},
+        {
+            "$set": {
+                "node_id": str(target.id),
+                "availability_zone": target.availability_zone,
+                "status": InstanceStatus.RUNNING,
+                "ipv4_address": remote.get("ipv4_address"),
+                "capacity_reserved": True,
+                "last_error": f"Recovered by administrator {admin.id} from {point.completed_at}",
+                "updated_at": now,
+            }
+        },
+    )
+    return {
+        "recovered": True,
+        "instance_id": str(item.id),
+        "target_node_id": str(target.id),
+        "ipv4_address": remote.get("ipv4_address"),
+    }
 
 
 @router.post("/nodes/{node_id}/update-agent")
@@ -59,12 +348,12 @@ async def update_node_agent(
             base = shlex.quote(data.control_plane_url)
             bootstrap = (
                 "set -e; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; "
-                f"curl -fsSL {base}/agent/agent.py -o \"$d/agent.py\"; "
+                f'curl -fsSL {base}/agent/agent.py -o "$d/agent.py"; '
                 f"curl -fsSL {base}/agent/localec2-agent.service "
-                "-o \"$d/localec2-agent.service\"; "
-                "install -o root -g root -m 0755 \"$d/agent.py\" "
+                '-o "$d/localec2-agent.service"; '
+                'install -o root -g root -m 0755 "$d/agent.py" '
                 "/opt/localec2-agent/agent.py; "
-                "install -o root -g root -m 0644 \"$d/localec2-agent.service\" "
+                'install -o root -g root -m 0644 "$d/localec2-agent.service" '
                 "/etc/systemd/system/localec2-agent.service; "
                 "systemd-run --unit=localec2-agent-bootstrap-update "
                 "--on-active=10s /bin/sh -c "
@@ -140,54 +429,63 @@ async def force_remove_node(
                 "instance_id": {"$in": instance_ids},
                 "status": {"$in": [OperationStatus.PENDING, OperationStatus.RUNNING]},
             },
-            {"$set": {
-                "status": OperationStatus.FAILED,
-                "progress": 100,
-                "message": "Cancelled by forced node removal",
-                "error_code": "ADMIN_FORCE_REMOVED_NODE",
-                "error_message": (
-                    f"Node {node.name} was force removed by platform administrator {admin.id}"
-                ),
-                "finished_at": now,
-            }},
+            {
+                "$set": {
+                    "status": OperationStatus.FAILED,
+                    "progress": 100,
+                    "message": "Cancelled by forced node removal",
+                    "error_code": "ADMIN_FORCE_REMOVED_NODE",
+                    "error_message": (
+                        f"Node {node.name} was force removed by platform administrator {admin.id}"
+                    ),
+                    "finished_at": now,
+                }
+            },
         )
         await database.instances.update_many(
             {"_id": {"$in": instance_ids}},
-            {"$set": {
-                "status": InstanceStatus.TERMINATING,
-                "capacity_reserved": False,
-                "deleted_at": now,
-                "ipv4_address": None,
-                "public_endpoint": None,
-                "public_endpoint_status": "DISABLED",
-                "last_error": f"Assigned node {node.name} was force removed",
-                "updated_at": now,
-            }},
+            {
+                "$set": {
+                    "status": InstanceStatus.TERMINATING,
+                    "capacity_reserved": False,
+                    "deleted_at": now,
+                    "ipv4_address": None,
+                    "public_endpoint": None,
+                    "public_endpoint_status": "DISABLED",
+                    "last_error": f"Assigned node {node.name} was force removed",
+                    "updated_at": now,
+                }
+            },
         )
     jobs = await database.node_jobs.count_documents(
         {"node_id": str(node.id), "status": {"$in": ["QUEUED", "LEASED"]}}
     )
     await database.node_jobs.update_many(
         {"node_id": str(node.id), "status": {"$in": ["QUEUED", "LEASED"]}},
-        {"$set": {
-            "status": "FAILED",
-            "error_message": "Cancelled because the compute node was force removed",
-            "lease_expires_at": None,
-            "finished_at": now,
-            "updated_at": now,
-        }},
+        {
+            "$set": {
+                "status": "FAILED",
+                "error_message": "Cancelled because the compute node was force removed",
+                "lease_expires_at": None,
+                "finished_at": now,
+                "updated_at": now,
+            }
+        },
     )
     volumes = await database.volumes.count_documents({"node_id": str(node.id)})
     await database.volumes.update_many(
         {"node_id": str(node.id)},
-        {"$set": {
-            "attached_instance_id": None,
-            "device_name": None,
-            "mount_path": None,
-            "node_id": None,
-            "last_node_id": str(node.id),
-            "updated_at": now,
-        }, "$unset": {"attachment_pending": ""}},
+        {
+            "$set": {
+                "attached_instance_id": None,
+                "device_name": None,
+                "mount_path": None,
+                "node_id": None,
+                "last_node_id": str(node.id),
+                "updated_at": now,
+            },
+            "$unset": {"attachment_pending": ""},
+        },
     )
     # Canonical AMI packages remain launchable. Only their former capture-node
     # association is cleared.
@@ -375,24 +673,28 @@ async def force_remove_instance(
             "instance_id": str(item.id),
             "status": {"$in": [OperationStatus.PENDING, OperationStatus.RUNNING]},
         },
-        {"$set": {
-            "status": OperationStatus.FAILED,
-            "progress": 100,
-            "message": "Cancelled by platform administrator",
-            "error_code": "ADMIN_FORCE_REMOVED",
-            "error_message": f"Force removed by platform administrator {admin.id}",
-            "finished_at": now,
-        }},
+        {
+            "$set": {
+                "status": OperationStatus.FAILED,
+                "progress": 100,
+                "message": "Cancelled by platform administrator",
+                "error_code": "ADMIN_FORCE_REMOVED",
+                "error_message": f"Force removed by platform administrator {admin.id}",
+                "finished_at": now,
+            }
+        },
     )
     await database.node_jobs.update_many(
         {"instance_id": str(item.id), "status": {"$in": ["QUEUED", "LEASED"]}},
-        {"$set": {
-            "status": "FAILED",
-            "error_message": "Cancelled by platform administrator force removal",
-            "lease_expires_at": None,
-            "finished_at": now,
-            "updated_at": now,
-        }},
+        {
+            "$set": {
+                "status": "FAILED",
+                "error_message": "Cancelled by platform administrator force removal",
+                "lease_expires_at": None,
+                "finished_at": now,
+                "updated_at": now,
+            }
+        },
     )
     cleanup_error = None
     if item.node_id:
@@ -408,27 +710,31 @@ async def force_remove_instance(
                 cleanup_error = str(exc)[:1000]
     await database.volumes.update_many(
         {"attached_instance_id": str(item.id)},
-        {"$set": {
-            "attached_instance_id": None,
-            "device_name": None,
-            "mount_path": None,
-            "node_id": None,
-            "last_node_id": str(item.node_id) if item.node_id else None,
-            "updated_at": now,
-        }},
+        {
+            "$set": {
+                "attached_instance_id": None,
+                "device_name": None,
+                "mount_path": None,
+                "node_id": None,
+                "last_node_id": str(item.node_id) if item.node_id else None,
+                "updated_at": now,
+            }
+        },
     )
     await scheduler.release_instance_capacity(database, item)
     await database.instances.update_one(
         {"_id": str(item.id)},
-        {"$set": {
-            "status": InstanceStatus.TERMINATING,
-            "deleted_at": now,
-            "ipv4_address": None,
-            "public_endpoint": None,
-            "public_endpoint_status": "DISABLED",
-            "last_error": cleanup_error,
-            "updated_at": now,
-        }},
+        {
+            "$set": {
+                "status": InstanceStatus.TERMINATING,
+                "deleted_at": now,
+                "ipv4_address": None,
+                "public_endpoint": None,
+                "public_endpoint_status": "DISABLED",
+                "last_error": cleanup_error,
+                "updated_at": now,
+            }
+        },
     )
     return {"removed": True, "host_cleanup_error": cleanup_error}
 

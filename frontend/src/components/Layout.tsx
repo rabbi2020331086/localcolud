@@ -18,6 +18,8 @@ import { NavLink, Outlet } from "react-router-dom";
 import { useState } from "react";
 import { api } from "../api/client";
 import { useAuth } from "../store/auth";
+import { PageErrorBoundary } from "./PageErrorBoundary";
+import { useLocation } from "react-router-dom";
 const links = [
   ["/", Gauge, "Overview"],
   ["/instances", Server, "Instances"],
@@ -34,6 +36,7 @@ export function Layout() {
   const [open, setOpen] = useState(false);
   const user = useAuth((s) => s.user);
   const clear = useAuth((s) => s.clear);
+  const location = useLocation();
   return (
     <div className="shell">
       <aside className={open ? "sidebar open" : "sidebar"}>
@@ -82,7 +85,9 @@ export function Layout() {
           </NavLink>
         </header>
         <div className="content">
-          <Outlet />
+          <PageErrorBoundary resetKey={location.pathname}>
+            <Outlet />
+          </PageErrorBoundary>
         </div>
       </main>
     </div>
