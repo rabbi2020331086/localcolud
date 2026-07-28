@@ -9,8 +9,8 @@ from uuid import uuid4
 from starlette.requests import Request
 
 from app.agent import NodeExecutor
-from app.api.dependencies import has_platform_admin_access
-from app.api.routes.auth import refresh_cookie_name
+from app.api.dependencies import has_platform_access, has_platform_admin_access
+from app.api.routes.auth import is_admin_client, refresh_cookie_name
 from app.api.routes.nodes import job_lease_seconds, observed_status
 from app.core.security import create_jwt, decode_jwt, hash_password, verify_password
 from app.infrastructure.models import (
@@ -58,6 +58,21 @@ def test_admin_and_customer_refresh_sessions_are_separate():
     admin = Request({"type": "http", "headers": [(b"x-localec2-client", b"admin")]})
     assert refresh_cookie_name(customer) == "localec2_refresh"
     assert refresh_cookie_name(admin) == "localec2_admin_refresh"
+    assert not is_admin_client(customer)
+    assert is_admin_client(admin)
+
+
+def test_only_platform_identities_have_admin_portal_access():
+    customer = User(email="customer@example.com", display_name="Customer", password_hash="x")
+    operator = User(
+        email="operator@example.com",
+        display_name="Operator",
+        password_hash="x",
+        platform_roles=["OPERATIONS"],
+    )
+
+    assert not has_platform_access(customer)
+    assert has_platform_access(operator)
 
 
 def test_node_agent_renders_libvirt_machine(tmp_path, monkeypatch):

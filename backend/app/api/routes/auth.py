@@ -5,7 +5,7 @@ import jwt
 from fastapi import APIRouter, HTTPException, Request, Response
 from pymongo.errors import DuplicateKeyError
 
-from app.api.dependencies import CurrentUser, has_platform_admin_access
+from app.api.dependencies import CurrentUser, has_platform_access, has_platform_admin_access
 from app.core.config import settings
 from app.core.security import create_jwt, decode_jwt, hash_password, token_hash, verify_password
 from app.infrastructure.database import Database, from_document, to_document
@@ -21,6 +21,10 @@ def refresh_cookie_name(request: Request) -> str:
         if request.headers.get("x-localec2-client", "").lower() == "admin"
         else "localec2_refresh"
     )
+
+
+def is_admin_client(request: Request) -> bool:
+    return request.headers.get("x-localec2-client", "").lower() == "admin"
 
 
 def cookie(request: Request, response: Response, value: str) -> None:
@@ -85,6 +89,8 @@ async def login(
     user = from_document(User, await database.users.find_one({"email": email}))
     if not user or not verify_password(data.password, user.password_hash):
         raise HTTPException(401, "Invalid email or password")
+    if is_admin_client(request) and not has_platform_access(user):
+        raise HTTPException(403, "This account is not authorized for the admin portal")
     return await issue(database, user, request, response)
 
 
@@ -125,6 +131,8 @@ async def refresh(request: Request, response: Response, database: Database) -> T
     user = from_document(User, await database.users.find_one({"_id": str(row.user_id)}))
     if not user:
         raise HTTPException(401, "Refresh session is invalid")
+    if is_admin_client(request) and not has_platform_access(user):
+        raise HTTPException(403, "This account is not authorized for the admin portal")
     return await issue(database, user, request, response)
 
 

@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, HTTPException
 from pymongo.errors import DuplicateKeyError
 
-from app.api.dependencies import PlatformAdmin, PlatformOperator
+from app.api.dependencies import PlatformAdmin, PlatformOperator, has_platform_admin_access
 from app.api.routes.nodes import observed_status
 from app.core.config import settings
 from app.core.security import hash_password
@@ -617,7 +617,7 @@ async def admin_instance(database: Database, instance_id: UUID) -> Instance:
 async def control_instance(
     instance_id: UUID,
     action: str,
-    admin: PlatformOperator,
+    admin: PlatformAdmin,
     database: Database,
 ) -> dict[str, object]:
     item = await admin_instance(database, instance_id)
@@ -849,7 +849,7 @@ async def all_volumes(admin: PlatformOperator, database: Database) -> list[dict[
 @router.post("/volumes/{volume_id}/detach")
 async def admin_detach_volume(
     volume_id: UUID,
-    admin: PlatformOperator,
+    admin: PlatformAdmin,
     database: Database,
 ) -> dict[str, object]:
     volume = from_document(Volume, await database.volumes.find_one({"_id": str(volume_id)}))
@@ -890,7 +890,7 @@ async def admin_detach_volume(
 @router.delete("/volumes/{volume_id}", status_code=204)
 async def admin_delete_volume(
     volume_id: UUID,
-    admin: PlatformOperator,
+    admin: PlatformAdmin,
     database: Database,
 ) -> None:
     volume = from_document(Volume, await database.volumes.find_one({"_id": str(volume_id)}))
@@ -963,7 +963,20 @@ async def all_operations(admin: PlatformOperator, database: Database) -> list[di
 
 @router.get("/team", response_model=list[TeamMemberOut])
 async def list_members(admin: PlatformAdmin, database: Database) -> list[TeamMemberOut]:
-    users = from_documents(User, await database.users.find({}).sort("created_at", 1).to_list(None))
+    identity_filter: dict[str, object] = {
+        "$or": [
+            {"is_platform_admin": True},
+            {"platform_roles": {"$exists": True, "$ne": []}},
+        ]
+    }
+    if settings.platform_admin_email.strip():
+        identity_filter["$or"].append(  # type: ignore[union-attr]
+            {"email": settings.platform_admin_email.strip().lower()}
+        )
+    users = from_documents(
+        User,
+        await database.users.find(identity_filter).sort("created_at", 1).to_list(None),
+    )
     return [member_output(user) for user in users]
 
 
@@ -991,7 +1004,7 @@ async def update_member(
     user_id: UUID, data: TeamMemberUpdate, admin: PlatformAdmin, database: Database
 ) -> TeamMemberOut:
     user = from_document(User, await database.users.find_one({"_id": str(user_id)}))
-    if not user:
+    if not user or not has_platform_admin_access(user) and not user.platform_roles:
         raise HTTPException(404, "Team member not found")
     if user.id == admin.id and (
         PlatformRole.ADMINISTRATOR not in data.platform_roles or not data.is_active

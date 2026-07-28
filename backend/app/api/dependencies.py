@@ -41,6 +41,11 @@ def has_platform_admin_access(user: User) -> bool:
     )
 
 
+def has_platform_access(user: User) -> bool:
+    """Return whether an identity is allowed to authenticate to the admin portal."""
+    return has_platform_admin_access(user) or bool(user.platform_roles)
+
+
 async def platform_admin(user: CurrentUser) -> User:
     if not has_platform_admin_access(user):
         raise HTTPException(403, "Platform administrator access is required")

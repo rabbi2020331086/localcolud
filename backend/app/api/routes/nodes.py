@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from app.api.dependencies import PlatformOperator
+from app.api.dependencies import PlatformAdmin, PlatformOperator
 from app.api.routes.agent_management import published_agent_path
 from app.core.config import settings
 from app.core.security import opaque_token, token_hash
@@ -79,7 +79,7 @@ async def list_nodes(user: PlatformOperator, database: Database) -> list[NodeOut
 
 
 @router.post("", response_model=NodeEnrollmentOut, status_code=201)
-async def enroll(data: NodeCreate, user: PlatformOperator, database: Database) -> NodeEnrollmentOut:
+async def enroll(data: NodeCreate, user: PlatformAdmin, database: Database) -> NodeEnrollmentOut:
     secret = opaque_token()
     node = CloudNode(
         user_id=user.id,
@@ -100,7 +100,7 @@ async def enroll(data: NodeCreate, user: PlatformOperator, database: Database) -
 
 @router.post("/{node_id}/rotate-token", response_model=NodeEnrollmentOut)
 async def rotate_token(
-    node_id: UUID, user: PlatformOperator, database: Database
+    node_id: UUID, user: PlatformAdmin, database: Database
 ) -> NodeEnrollmentOut:
     node = await existing(database, node_id)
     secret = opaque_token()
@@ -117,7 +117,7 @@ async def rotate_token(
 
 @router.patch("/{node_id}", response_model=NodeOut)
 async def update_node(
-    node_id: UUID, data: NodeUpdate, user: PlatformOperator, database: Database
+    node_id: UUID, data: NodeUpdate, user: PlatformAdmin, database: Database
 ) -> NodeOut:
     node = await existing(database, node_id)
     changes = data.model_dump(exclude_none=True)
@@ -167,7 +167,7 @@ async def update_node(
 
 
 @router.delete("/{node_id}", status_code=204)
-async def delete_node(node_id: UUID, user: PlatformOperator, database: Database) -> None:
+async def delete_node(node_id: UUID, user: PlatformAdmin, database: Database) -> None:
     node = await existing(database, node_id)
     if await database.instances.find_one({"node_id": str(node.id), "deleted_at": None}):
         raise HTTPException(409, "Drain or terminate instances before removing this node")

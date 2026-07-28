@@ -5,13 +5,13 @@ import type { CloudNode, NodeContribution } from "./types";
 
 type Tab = "summary" | "terminal" | "analysis" | "resources" | "setup";
 
-export function NodeDetails({ node, contribution, token, agentUrl, updating, reservationPolicy, onBack, onAgentUrl, onUpdateAgent, onSetup, onApprove, onToggleScheduling, onRemove, onForceRemove }:
-  { node: CloudNode; contribution?: NodeContribution; token: string; agentUrl: string; updating: boolean; reservationPolicy: ReactNode; onBack: () => void; onAgentUrl: (value: string) => void; onUpdateAgent: () => void; onSetup: () => void; onApprove: () => void; onToggleScheduling: () => void; onRemove: () => void; onForceRemove: () => void }) {
+export function NodeDetails({ node, contribution, token, isAdmin, agentUrl, updating, reservationPolicy, onBack, onAgentUrl, onUpdateAgent, onSetup, onApprove, onToggleScheduling, onRemove, onForceRemove }:
+  { node: CloudNode; contribution?: NodeContribution; token: string; isAdmin: boolean; agentUrl: string; updating: boolean; reservationPolicy: ReactNode; onBack: () => void; onAgentUrl: (value: string) => void; onUpdateAgent: () => void; onSetup: () => void; onApprove: () => void; onToggleScheduling: () => void; onRemove: () => void; onForceRemove: () => void }) {
   const [tab, setTab] = useState<Tab>("summary");
   const tabs: [Tab, typeof Server, string][] = [
-    ["summary", Server, "Summary"], ["terminal", Terminal, "Terminal"],
+    ["summary", Server, "Summary"], ...(isAdmin ? [["terminal", Terminal, "Terminal"] as [Tab, typeof Server, string]] : []),
     ["analysis", Activity, "Analysis"], ["resources", Gauge, "Resources"],
-    ["setup", Settings, "Setup options"],
+    ...(isAdmin ? [["setup", Settings, "Setup options"] as [Tab, typeof Server, string]] : []),
   ];
   const online = node.status === "ONLINE";
   const allocatableCpu = Math.max(0, node.cpu_total - node.cpu_reserved);
